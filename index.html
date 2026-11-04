@@ -1061,9 +1061,15 @@ function scoreShort(x, ctx) {
   /* 大盘环境分层降权：
      下行市场“逆势强势”结构 53% 胜率保留；
      其余非逆势但技术形态尚可的标的，给予 0.55 系数、上限 58，避免分数集体归零 */
+  let rawFinal = raw;
+  /* 放量反弹黄金信号：熊市但大盘相对放量（MA60 下 + 量 ≥ 1.1×20日均），回测 5 日胜率 53.2% / +0.77% */
+  if (ctx.bearGold) { rawFinal += 5; reasons.push('放量反弹·黄金信号'); }
+  /* 缩量阴跌降权：熊市且量能持续萎缩，这段时段 5 日均 -0.4% */
+  if (ctx.bearTight) { rawFinal -= 4; if (typeof risks !== 'undefined') risks.push('缩量阴跌中，谨慎入场'); }
+
   const score = marketDown
-    ? clamp(Math.min(resilient ? raw * 0.95 : raw * 0.55, resilient ? 85 : 58), 0, 100)
-    : clamp(raw, 0, 100);
+    ? clamp(Math.min(resilient ? rawFinal * 0.95 : rawFinal * 0.55, resilient ? 85 : 58), 0, 100)
+    : clamp(rawFinal, 0, 100);
 
   /* 形态归类 + 回测统计（用于卡片与详情的“胜率参考”） */
   const si = setupInfoForShort(x, ctx);
@@ -2781,10 +2787,20 @@ async function ensureWatchStock(code) {
     /* 大盘条件 */
     const idx = state.indexes && state.indexes['sh000001'];
     if (idx && idx.bars && idx.bars.length >= 260) {
-      const idxBars = idx.bars, idxC = idxBars.map(b => b.c);
-      const idxMa20 = SMA(idxC, 20);
-      const lastC = idxC[idxC.length - 1], lastMa20 = idxMa20[idxMa20.length - 1];
+      const idxBars = idx.bars, idxC = idxBars.map(b => b.c), idxV = idxBars.map(b => b.v || 0);
+      const idxMa20 = SMA(idxC, 20), idxMa60 = SMA(idxC, 60), idxVolMa20 = SMA(idxV, 20);
+      const lastC = idxC[idxC.length - 1], lastMa20 = idxMa20[idxMa20.length - 1], lastMa60 = idxMa60[idxMa60.length - 1];
+      const lastVolRatio = idxVolMa20 && idxVolMa20[idxVolMa20.length - 1] > 0 ? idxV[idxV.length - 1] / idxVolMa20[idxVolMa20.length - 1] : 1;
       ctx.marketUp = lastC >= lastMa20;
+      /* 缩量阴跌过滤 + 放量反弹黄金信号：
+         - 熊市（指数在 MA60 下方）但大盘成交量相对 20 日均 > 1.1 倍 = 放量反弹，回测 5 日胜率 53.2% / +0.77%
+         - 连续下跌 ≥ 6 天 + 量比 < 0.6 = 缩量阴跌，这段时段 5 日均 -0.4%
+         bearGold 置顶显示、bearTight 标记为"阴跌中谨慎" */
+      ctx.bearGold = (lastC < lastMa60) && lastVolRatio >= 1.1;
+      ctx.bearTight = (lastC < lastMa60) && lastVolRatio < 0.6;
+      ctx.volRatio = lastVolRatio;
+      state.bearGold = ctx.bearGold;
+      state.bearTight = ctx.bearTight;
     }
     x.long = scoreLong(x, ctx);
     x.short = scoreShort(x, ctx);
@@ -3231,9 +3247,17 @@ function renderList() {
   }
   if (mode === 'short' && !state.search && state.ind === '全部') {
     const down = state.marketUp === false;
-    html += '<div class="notice' + (down ? ' warn' : '') + '">' + (down
+    const gold = state.bearGold === true;
+    const tight = state.bearTight === true;
+    html += '<div class="notice' + (down || tight ? ' warn' : '') + '">' + (
+      gold
+      ? '<b>🔥 放量反弹黄金窗口</b>：熊市（上证 MA60 下方）但大盘成交量放大（相对 20 日均 ≥ 1.1×），11 年回测这段时段 5 日胜率 <b>53.2%</b>、均收 <b>+0.77%</b>。短线形态已自适应切换为"弱势反抽 + 超卖反弹 + 趋势延续"组合，bearGold 加分生效。可适度提高仓位，持有 5 日或破 3 日线离场。'
+      : tight
+      ? '<b>⚠️ 缩量阴跌预警</b>：熊市且大盘成交量持续萎缩（相对 20 日均 < 0.6×），回测这段时段 5 日均 -0.4%。bearTight 降权已生效，分数会偏低是正常的；轻仓观望或等放量信号再进场。'
+      : down
       ? '<b>大盘下行（熊市）</b>：自适应精选 11 年回测确认熊市里「弱势反抽 + 趋势延续 + 超卖反弹」胜率最高（5 日胜率 49.1%、均收 +0.30%）；放量突破追高容易被套，已默认剔除。同票 20 天冷却期。'
-      : '<b>大盘多头（牛市）</b>：自适应精选只留 11 年实测牛市正期望形态「放量突破 + 趋势延续」（牛市里 breakout +0.39%、trend +0.13%）；弱势反抽/超卖反弹属熊市博弈，默认隐藏。持有 3–5 日或配合冷却期轮换。') + '</div>';
+      : '<b>大盘多头（牛市）</b>：自适应精选只留 11 年实测牛市正期望形态「放量突破 + 趋势延续」（牛市里 breakout +0.39%、trend +0.13%）；弱势反抽/超卖反弹属熊市博弈，默认隐藏。持有 3–5 日或配合冷却期轮换。'
+    ) + '</div>';
   }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (rest.length) {
