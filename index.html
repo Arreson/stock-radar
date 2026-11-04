@@ -1644,9 +1644,9 @@ function buildBacktestHTML() {
   const rows = Object.keys(DEFAULTS).map(k => {
     const bt = S && S[k] && S[k].samples >= 5 ? S[k] : null;
     const d = DEFAULTS[k];
-    /* wr：浏览器回测（当前市场池）优先；未回测则回落 12 年实测基准 */
-    const wr = wrFor(k, 3, state.marketUp);
-    const avgRet = avgRetFor(k, 3, state.marketUp);
+    /* wr：浏览器回测（当前市场池）优先；未回测则回落 12 年实测基准（均为 5 日口径） */
+    const wr = wrFor(k, 5, state.marketUp);
+    const avgRet = avgRetFor(k, 5, state.marketUp);
     const samples = bt ? bt.samples : 0;
     return { key: k, name: d.name, hold: d.hold, wr, avgRet, samples, bt };
   });
@@ -1826,8 +1826,8 @@ function setupInfoForShort(x, ctx) {
   const resilient = ctx.marketUp === false && slope(I.ma20, 20) > 0 && c > last(I.ma20) &&
     isNum(last(I.ma60)) && c > last(I.ma60) && I.ret20 > 0 &&
     (!ctx.secUp || !x.sector || ctx.secUp[x.sector] !== false);
-  const wr = wrFor(setup, 3, ctx.marketUp);
-  const avgRet = avgRetFor(setup, 3, ctx.marketUp);
+  const wr = wrFor(setup, 5, ctx.marketUp);
+  const avgRet = avgRetFor(setup, 5, ctx.marketUp);
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
   return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, hold: S.hold, resilient };
 }
