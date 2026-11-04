@@ -1231,6 +1231,11 @@ function scoreShort(x, ctx) {
   const reasons = [];
   if (ctx.bearGold) reasons.push('🔥放量反弹·黄金窗口');
   if (ctx.bearTight) reasons.push('⚠️缩量阴跌中谨慎');
+  /* 融资融券杠杆情绪（A股特有·T+1披露）：5日融资余额变化 > +0.5% = 杠杆资金进场 */
+  if (isNum(ctx.margin5d)) {
+    if (ctx.margin5d >= 0.5) { score = clamp(score + 2, 0, 100); reasons.push('融资余额5日+' + ctx.margin5d.toFixed(1) + '%·杠杆进场'); }
+    else if (ctx.margin5d <= -1.5) { score = clamp(score - 2, 0, 100); risks.push('融资余额5日' + ctx.margin5d.toFixed(1) + '%·杠杆撤退'); }
+  }
   if (setup === 'resilient') reasons.push('逆势强势');
   if (I.limitStreak >= 2) reasons.push('连板 ' + I.limitStreak + ' 天');
   else if (I.limitStreak === 1) reasons.push('涨停首板');
@@ -1348,10 +1353,11 @@ function runBacktest() {
   const HOLD_DAYS = [2, 3, 5];
   const RULE_MAX = 10;   /* 规则离场：最长持有天数 */
   const RULE_STOP = 0.07;/* 规则离场：浮亏 7% 止损 */
+  const TP_LEVELS = [0.05, 0.08]; /* 主动止盈：盘中触及 +5% / +8% 即按止盈价卖出 */
   /* 累加器 */
   const agg = {};
   for (const k of Object.keys(SHORT_SETUP)) {
-    agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0], rN: 0, rWin: 0, rSum: 0, rHold: 0 };
+    agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0], rN: 0, rWin: 0, rSum: 0, rHold: 0, tpN: 0, tpWin: [0, 0], tpSum: [0, 0] };
   }
 
   let totalSignals = 0;
@@ -1407,6 +1413,22 @@ function runBacktest() {
       op.rSum += rret;
       op.rHold += exitIdx - (i + 1);
 
+      /* 主动止盈模拟：RULE_MAX 日内盘中最高价触及 +TP 即按止盈价卖出，否则最后一日收盘卖。
+         回测结论（31,583 样本）：TP+8% 期望最优（bearGold 均收 +1.04% vs 持有5日 +0.67%），
+         TP+2% 胜率虽达 74~80% 但均收≈0（赢小亏大陷阱）。 */
+      const tpEnd = Math.min(i + 1 + RULE_MAX, N - 1);
+      for (let t = 0; t < TP_LEVELS.length; t++) {
+        const tp = TP_LEVELS[t];
+        let tpRet = null;
+        for (let k = i + 1; k <= tpEnd; k++) {
+          if (bars[k].h >= buy * (1 + tp)) { tpRet = tp - COST; break; }
+        }
+        if (tpRet === null) tpRet = c[tpEnd] / buy - 1 - COST;
+        op.tpN++;
+        op.tpSum[t] += tpRet;
+        if (tpRet > 0) op.tpWin[t]++;
+      }
+
       if (!minDate || bars[i].d < minDate) minDate = bars[i].d;
       if (bars[i].d > maxDate) maxDate = bars[i].d;
     }
@@ -1429,6 +1451,12 @@ function runBacktest() {
       ruleWr: op.rN >= 5 ? Math.round(op.rWin / op.rN * 100) : 0,
       ruleAvg: op.rN >= 5 ? +(op.rSum / op.rN * 100).toFixed(2) : 0,
       ruleHold: op.rN >= 5 ? +(op.rHold / op.rN).toFixed(1) : 0,
+      /* 主动止盈（TP+5% / TP+8%，盘中触及即卖，最长 10 日） */
+      tpN: op.tpN,
+      tp5Wr: op.tpN >= 5 ? Math.round(op.tpWin[0] / op.tpN * 100) : 0,
+      tp5Avg: op.tpN >= 5 ? +(op.tpSum[0] / op.tpN * 100).toFixed(2) : 0,
+      tp8Wr: op.tpN >= 5 ? Math.round(op.tpWin[1] / op.tpN * 100) : 0,
+      tp8Avg: op.tpN >= 5 ? +(op.tpSum[1] / op.tpN * 100).toFixed(2) : 0,
     };
   }
   state.backtest = result;
@@ -1680,6 +1708,30 @@ function buildBacktestHTML() {
     }
   }
 
+  /* 主动止盈对照：盘中触及 +5%/+8% 即卖，最长 10 日（路线A回测产物） */
+  let tpHTML = '';
+  if (hasBT) {
+    const tpRows = rows.filter(r => S[r.key] && S[r.key].tpN >= 5);
+    if (tpRows.length) {
+      const fp = v => (v >= 0 ? '+' : '') + v + '%';
+      tpHTML = '<h4>主动止盈对照（盘中触及即卖 · 最长 10 日）</h4>' +
+        '<table class="bt">' +
+        '<thead><tr><th>形态</th><th>TP+5% 胜率</th><th>TP+5% 均收</th><th>TP+8% 胜率</th><th>TP+8% 均收</th><th>固定3日均收</th></tr></thead>' +
+        tpRows.map(r => {
+          const b = S[r.key];
+          return '<tr><td>' + r.name + '</td>' +
+            '<td>' + b.tp5Wr + '%</td>' +
+            '<td>' + fp(b.tp5Avg) + '</td>' +
+            '<td><b>' + b.tp8Wr + '%</b></td>' +
+            '<td><b>' + fp(b.tp8Avg) + '</b></td>' +
+            '<td>' + fp(b.avgRet3) + '</td></tr>';
+        }).join('') +
+        '</table>' +
+        '<p class="dim" style="font-size:11px;margin:4px 0 0">⚠️ 胜率陷阱：TP+2% 胜率可达 74~80%，但均收≈0（赢小亏大、盈亏比 &lt; 1）。' +
+        '期望最优是 <b>TP+8%</b>——黄金窗口时段回测均收 +1.04%（vs 持有 5 日 +0.67%），弱反形态 +1.13%（翻倍）。胜率高 ≠ 赚钱。</p>';
+    }
+  }
+
   const cfg = '<div style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;flex-wrap:wrap">' +
     '<label for="btCost">双边成本</label>' +
     '<input id="btCost" type="number" min="0" max="3" step="0.05" value="' + costVal + '" ' +
@@ -1699,7 +1751,7 @@ function buildBacktestHTML() {
     '<thead><tr><th>形态</th><th>3 日胜率</th><th>来源</th></tr></thead>' +
     '<tbody>' + rowsHTML + '</tbody>' +
     '</table>' +
-    holdHTML + ruleHTML + cfg +
+    holdHTML + ruleHTML + tpHTML + cfg +
     note + btn + '</section>';
 }
 
@@ -1864,7 +1916,7 @@ function shortPlan(x, o) {
     ['持有周期', setup.hold],
     ['参考买点', fmt(c) + '（回踩 5 日线 ' + fmt(ma5) + ' 更佳）'],
     ['止损纪律', '收盘跌破 ' + fmt(stop) + '（约 -' + fmt(stopPct, 1) + '%）'],
-    ['止盈方式', '不设固定目标，跌破 3 日线分批离场'],
+    ['止盈方式', '回测最优：TP+8% 主动止盈（10 日内触及即卖）；未触及则跌破 3 日线离场'],
     ['时间止损', '3 个交易日不创新高即撤'],
     ['建议仓位', pos + '%（ATR 单位 ' + atrUnit + '% · 半凯利 ' + kelly + '%' + (o.marketDown ? ' · 大盘下行×0.6' : '') + '）']
   ];
@@ -2017,6 +2069,20 @@ function scoreAll() {
   ctx.secUp = sec.up;
   ctx.marketUp = marketTrendUp();
   state.marketUp = ctx.marketUp;
+  /* 大盘黄金窗口/阴跌状态（主流程统一在此计算，与 ensureWatchStock 口径一致） */
+  const _ix = state.indexes && state.indexes['sh000001'];
+  if (_ix && _ix.bars && _ix.bars.length >= 260) {
+    const iC = _ix.bars.map(b => b.c), iV = _ix.bars.map(b => b.v || 0);
+    const iMa60 = SMA(iC, 60), iVolMa20 = SMA(iV, 20);
+    const li = iC.length - 1;
+    const ivr = (iVolMa20[li] > 0) ? (iV[li] / iVolMa20[li]) : 1;
+    ctx.bearGold = iC[li] < iMa60[li] && ivr >= 1.1;
+    ctx.bearTight = iC[li] < iMa60[li] && ivr < 0.6;
+    state.bearGold = ctx.bearGold;
+    state.bearTight = ctx.bearTight;
+  }
+  /* 融资融券杠杆情绪（路线B：fetchMarginSentiment 异步填充 state.margin） */
+  if (state.margin && isNum(state.margin.chg5d)) ctx.margin5d = state.margin.chg5d;
   list.forEach(x => { x.long = scoreLong(x, ctx); x.short = scoreShort(x, ctx); });
   state.scoredCount = list.length;
 }
@@ -2117,6 +2183,48 @@ function jsonp(url, ms) {
     s.onerror = () => fail(new Error('网络错误'));
     document.head.appendChild(s);
   });
+}
+
+/* datacenter-web 系列 JSONP（参数名是 callback= 而非 cb=） */
+function dcJSON(url, ms) {
+  return new Promise((resolve, reject) => {
+    const name = '__qrDc' + (++jpSeq);
+    const s = document.createElement('script');
+    let done = false;
+    const clean = () => {
+      clearTimeout(timer);
+      try { delete window[name]; } catch (e) { window[name] = undefined; }
+      s.onerror = null;
+      if (s.parentNode) s.parentNode.removeChild(s);
+    };
+    const fail = e => { if (done) return; done = true; clean(); reject(e || new Error('网络错误')); };
+    const timer = setTimeout(() => fail(new Error('超时')), ms || 10000);
+    window[name] = data => { if (done) return; done = true; clean(); resolve(data); };
+    s.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'callback=' + name;
+    s.onerror = () => fail(new Error('网络错误'));
+    document.head.appendChild(s);
+  });
+}
+
+/* —— 融资融券杠杆情绪（A股特有指标 · T+1 披露 · 路线B）——
+   报表 RPTA_RZRQ_LSHJ：市场级两融历史（2010 年至今），
+   RZYE=融资余额(元)、RZRQYE=两融余额、ZDF5D=融资余额5日变化率(%)
+   用法：5日变化率 ≥ +0.5% = 杠杆资金进场（scoreShort +2）；≤ -1.5% = 杠杆撤退（-2）
+   注：北向资金净流入已于 2024-08 起停止披露（接口实测全 0），两融是当前唯一可用的资金面代理 */
+async function fetchMarginSentiment() {
+  try {
+    const j = await dcJSON('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPTA_RZRQ_LSHJ' +
+      '&columns=DIM_DATE,RZYE,RZRQYE,ZDF5D&pageSize=10&sortColumns=DIM_DATE&sortTypes=-1', 8000);
+    const rows = j && j.result && j.result.data;
+    if (!rows || !rows.length) return null;
+    const latest = rows[0];
+    state.margin = {
+      date: String(latest.DIM_DATE || '').slice(0, 10),
+      rzYe: Math.round((+latest.RZYE || 0) / 1e8),  /* 元 → 亿 */
+      chg5d: isNum(+latest.ZDF5D) ? +(+latest.ZDF5D).toFixed(2) : null,
+    };
+    return state.margin;
+  } catch (e) { return null; }
 }
 
 /* 腾讯：_var= 形式的脚本注入，执行后从全局变量读取 */
@@ -2864,6 +2972,14 @@ async function refreshFull(opts) {
     const ml = await fetchMarketList((d, t) => setProgress(d, t, '全市场快照'));
     const norm = normalizeMarket(ml.rows, shToday());
     state.marketTotal = ml.total || norm.length;
+    /* 市场情绪温度：全市场快照统计涨跌停家数（A股特有情绪指标，零额外请求） */
+    state.mktSenti = {
+      limitUp: norm.filter(r => r.pct >= 9.8).length,
+      limitDown: norm.filter(r => r.pct <= -9.8).length,
+      up5: norm.filter(r => r.pct >= 5).length,
+      down5: norm.filter(r => r.pct <= -5).length,
+      total: norm.length
+    };
     metas = prescreen(norm, COVER_N);
     if (metas.length < 40) throw new Error('初筛候选不足');
     $('#loadStatus').textContent = '全市场 ' + (ml.total || norm.length) + ' 只 · 初筛 ' + metas.length + ' 只';
@@ -2931,6 +3047,11 @@ async function refreshFull(opts) {
     showSync(false);
     showOverlay(false);
     render();
+    /* ★ 融资融券情绪异步补充（路线B）：拿到后带 margin5d 重算分数并刷新 */
+    (async () => {
+      const mg = await fetchMarginSentiment();
+      if (mg && isNum(mg.chg5d)) { scoreAll(); render(); }
+    })();
     /* ★ 分钟级数据异步补充：拉 Top 15 短线精选票的 5 分钟线，
        计算 VWAP/早盘/尾盘 等日内因子，不阻塞主流程 */
     (async () => {
@@ -3690,7 +3811,7 @@ function renderList() {
     const tight = state.bearTight === true;
     html += '<div class="notice' + (down || tight ? ' warn' : '') + '">' + (
       gold
-      ? '<b>🔥 放量反弹黄金窗口</b>：熊市（上证 MA60 下方）但大盘成交量放大（相对 20 日均 ≥ 1.1×），11 年回测这段时段 5 日胜率 <b>53.2%</b>、均收 <b>+0.77%</b>。短线形态已自适应切换为"弱势反抽 + 超卖反弹 + 趋势延续"组合，bearGold 加分生效。可适度提高仓位，持有 5 日或破 3 日线离场。'
+      ? '<b>🔥 放量反弹黄金窗口</b>：熊市（上证 MA60 下方）但大盘成交量放大（相对 20 日均 ≥ 1.1×），11 年回测这段时段 5 日胜率 <b>53.2%</b>、均收 <b>+0.77%</b>。短线形态已自适应切换为"弱势反抽 + 超卖反弹 + 趋势延续"组合，bearGold 加分生效。可适度提高仓位，TP+8% 主动止盈（回测均收 +1.04% vs 持有 5 日 +0.67%）或破 3 日线离场。'
       : tight
       ? '<b>⚠️ 缩量阴跌预警</b>：熊市且大盘成交量持续萎缩（相对 20 日均 < 0.6×），回测这段时段 5 日均 -0.4%。bearTight 降权已生效，分数会偏低是正常的；轻仓观望或等放量信号再进场。'
       : down
@@ -3698,6 +3819,22 @@ function renderList() {
       : '<b>大盘多头（牛市）</b>：自适应精选只留 11 年实测牛市正期望形态「放量突破 + 趋势延续」（牛市里 breakout +0.39%、trend +0.13%）；弱势反抽/超卖反弹属熊市博弈，默认隐藏。持有 3–5 日或配合冷却期轮换。'
     ) + '</div>';
   }
+  /* 资金面情绪行：两融杠杆（T+1）+ 涨跌停温度（实时快照） */
+  if (!search) {
+    const bits = [];
+    if (state.margin && isNum(state.margin.chg5d)) {
+      const mg = state.margin;
+      const chg = (mg.chg5d >= 0 ? '+' : '') + mg.chg5d + '%';
+      const tag = mg.chg5d >= 0.5 ? ' · 杠杆资金进场' : (mg.chg5d <= -1.5 ? ' · 杠杆撤退' : '');
+      bits.push('融资余额 ' + (mg.rzYe >= 10000 ? (mg.rzYe / 10000).toFixed(2) + ' 万亿' : mg.rzYe + ' 亿') + ' · 5日 ' + chg + tag + '（' + mg.date + '）');
+    }
+    if (state.mktSenti && state.mktSenti.total) {
+      const ms = state.mktSenti;
+      bits.push('涨停 <b>' + ms.limitUp + '</b> 家 · 跌停 <b>' + ms.limitDown + '</b> 家 · 涨超5% ' + ms.up5 + ' 家');
+    }
+    if (bits.length) html += '<div class="notice" style="font-size:11px;padding:6px 10px">📊 ' + bits.join(' ｜ ') + '</div>';
+  }
+
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (rest.length) {
     html += '<div class="sec"><b>全部排名</b><span>第 9 – ' + (rest.length + 8) + ' 名 · 共 ' + arr.length + ' 只</span></div>' +
