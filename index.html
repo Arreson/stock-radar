@@ -3916,7 +3916,10 @@ function renderWatch() {
     .map(o => {
       const meta = state.watchMeta[o.code];
       const adv = watchAdvice(o.x, meta);
-      return { ...o, meta, adv };
+      /* 次日方向概率：复用短线引擎（形态×市场基准 + bearGold/量能/KDJ 调整） */
+      let nd = null;
+      try { nd = nextDayForecast(o.x, { marketUp: state.marketUp, bearGold: state.bearGold }, o.x.short.setup); } catch (e) {}
+      return { ...o, meta, adv, nd };
     });
   const pulling = Array.from(state.watch)
     .map(code => state.data[code])
@@ -3974,10 +3977,11 @@ function renderWatch() {
   });
 
   /* —— 汇总面板统计（用 filteredArr）—— */
-  let sumPct = 0, nPct = 0;
+  let sumPct = 0, nPct = 0, ndUp = 0;
   const counts = { '顺势持有': 0, '继续观察': 0, '观望': 0, '考虑减仓': 0, '建议止损': 0, '无锚定': 0 };
   filteredArr.forEach(o => {
     const v = o.adv;
+    if (o.nd && o.nd.prob >= 55) ndUp++;
     if (!v) { counts['无锚定']++; return; }
     if (v.pct != null) { sumPct += v.pct; nPct++; }
     if (counts[v.verdict] != null) counts[v.verdict]++;
@@ -4014,6 +4018,7 @@ function renderWatch() {
     '<div style="display:flex;flex-wrap:wrap;gap:6px 14px;padding:10px 14px;background:linear-gradient(135deg,rgba(88,166,255,.06),rgba(162,85,255,.06));border:1px solid var(--line);border-radius:12px">' +
     '<div style="font-size:11px;color:var(--muted);min-width:48px">自选 <b class="num" style="font-size:14px;color:var(--txt)">' + filteredArr.length + '</b>/' + arr.length + ' 只</div>' +
     '<div style="font-size:11px;color:var(--muted);min-width:60px">平均浮盈 <b class="num ' + (avgPct != null && avgPct >= 0 ? 'up' : 'down') + '" style="font-size:14px">' + (avgPct != null ? signTxt(avgPct, 1) : '—') + '</b></div>' +
+    '<div style="font-size:11px;color:var(--muted);min-width:72px" title="次日收阳概率≥55%的自选数量（12年实测条件概率）">明日偏涨 <b class="num" style="font-size:14px;color:' + (ndUp > 0 ? 'var(--green)' : 'var(--dim)') + '">' + ndUp + '</b> 只</div>' +
     clearFilterBtn +
     '</div>' +
     '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px">' +
@@ -4037,7 +4042,7 @@ function renderWatch() {
     ).join('');
   }
 
-  html += filteredArr.map(({ code, x, meta, adv, cyqShape, cyqShapeName }) => {
+  html += filteredArr.map(({ code, x, meta, adv, cyqShape, cyqShapeName, nd }) => {
     const pctCls = x.pct >= 0 ? 'up' : 'down';
     const ws = Math.max(x.long.score, x.short.score);
 
@@ -4065,8 +4070,10 @@ function renderWatch() {
       const pctTxt = adv.pct != null ? '自选 ' + (adv.pct >= 0 ? '+' : '') + fmt(adv.pct, 2) + '%' : '';
       const shapeTxt = cyqShapeName ? '筹码·' + cyqShapeName : '';
       const sigTxt = [...adv.flags, ...adv.risks].slice(0, 3).join(' · ');
+      /* 次日方向概率徽章（12 年实测条件概率） */
+      const ndTxt = nd ? '<span style="color:' + (nd.prob >= 55 ? 'var(--green)' : nd.prob >= 50 ? 'var(--yellow)' : 'var(--red)') + ';font-weight:600" title="次日收阳概率 · ' + (x.short.setupName || '') + (nd.notes.length ? ' · ' + nd.notes.join(' · ') : '') + '">次日↑' + nd.prob.toFixed(0) + '%</span>' : '';
       adviceRow = '<div class="watch-advice">' +
-        '<div class="wa-top"><span class="wa-verdict" style="color:' + tone + '">◆ ' + adv.verdict + '</span><span class="wa-score">信号分 ' + (adv.score >= 0 ? '+' : '') + adv.score + (shapeTxt ? ' · ' + shapeTxt : '') + '</span></div>' +
+        '<div class="wa-top"><span class="wa-verdict" style="color:' + tone + '">◆ ' + adv.verdict + '</span><span class="wa-score">' + ndTxt + (ndTxt ? ' · ' : '') + '信号分 ' + (adv.score >= 0 ? '+' : '') + adv.score + (shapeTxt ? ' · ' + shapeTxt : '') + '</span></div>' +
         '<div class="wa-sub">' + anchorTxt + (pctTxt ? ' · ' + pctTxt : '') + (sigTxt ? ' · ' + sigTxt : '') + '</div>' +
         '<div class="wa-suggestion">' + adv.suggestion + '</div>' +
       '</div>';
