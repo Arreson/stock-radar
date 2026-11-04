@@ -1264,6 +1264,7 @@ function scoreShort(x, ctx) {
     winRate: si.wr, avgRet: si.avgRet,
     hold: S.hold, samples: (state.backtest && state.backtest[setup] && state.backtest[setup].samples) || 0,
     regime: marketDown ? 'down' : 'up',
+    nextDay: nextDayForecast(x, ctx, setup),
     plan: shortPlan(x, { marketDown, marketUp: ctx.marketUp, setup })
   };
 
@@ -1830,6 +1831,53 @@ function setupInfoForShort(x, ctx) {
   const avgRet = avgRetFor(setup, 5, ctx.marketUp);
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
   return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, hold: S.hold, resilient };
+}
+
+/* ============ 次日方向概率引擎（12 年 · 49,412 样本条件概率实测） ============
+   注意：这是统计概率不是预测保证。全样本基准 = 47.8%，日线条件最多抬到 55~65%。
+   基准概率（形态 × 市场）次日收阳概率实测：
+     bounce 熊 51.9 / 牛 46.6 | weak 熊 50.8 | trend 熊 48.6 / 牛 47.1
+     resilient 熊 48.7 | kdj 熊 48.9 / 牛 45.6 | breakout 熊 43.0 / 牛 43.8
+     gap 牛 47.6 | limitStreak≥1 全样本 54.8
+   调整项（pp 加性，均为实测偏离）：
+     bearGold 叠加 bounce +13.1 → 65.0%（n=294）；bearGold 叠加 weak +5.3；bearGold 通用 +5
+     trend 熊 J<20 +8.5；trend J>80 -4.0；kdj 熊+放量 -10.4（危险信号）
+     bounce 熊+放量 +3.8；limitStreak≥1 +7.0 */
+const NEXT_DAY_BASE = {
+  bounce:    { bull: 46.6, bear: 51.9 },
+  weak:      { bull: 46.5, bear: 50.8 },
+  trend:     { bull: 47.1, bear: 48.6 },
+  resilient: { bull: 48.0, bear: 48.7 },
+  kdj:       { bull: 45.6, bear: 48.9 },
+  breakout:  { bull: 43.8, bear: 43.0 },
+  gap:       { bull: 47.6, bear: 50.0 },
+  limitup:   { bull: 54.8, bear: 54.8 }
+};
+function nextDayForecast(x, ctx, setup) {
+  const I = x.ind;
+  if (!I || !I.c || !I.c.length) return null;
+  const base = (NEXT_DAY_BASE[setup] || NEXT_DAY_BASE.weak)[ctx.marketUp === false ? 'bear' : 'bull'];
+  let p = base;
+  const notes = [];
+  /* bearGold 叠加：bounce 效果最强 */
+  if (ctx.bearGold) {
+    const lift = setup === 'bounce' ? 13.1 : setup === 'weak' ? 5.3 : 5.0;
+    p += lift; notes.push('黄金窗口 +' + lift.toFixed(0) + 'pp');
+  }
+  /* KDJ 位置 */
+  const J = last(I.J);
+  if (setup === 'trend' && ctx.marketUp === false && J < 20) { p += 8.5; notes.push('低位趋势 +' + 8.5 + 'pp'); }
+  else if ((setup === 'trend' || setup === 'breakout' || setup === 'gap') && J > 80) { p -= 4.0; notes.push('J 值超买 -4pp'); }
+  /* 量能：kdj 熊市放量是危险信号，bounce 放量是确认 */
+  const vr = last(I.vol5) > 0 ? last(I.v) / last(I.vol5) : 1;
+  if (setup === 'kdj' && ctx.marketUp === false && vr >= 1.5) { p -= 10.4; notes.push('放量拐点多为假信号 -10pp'); }
+  else if (setup === 'bounce' && ctx.marketUp === false && vr >= 1.5) { p += 3.8; notes.push('放量超卖确认 +4pp'); }
+  /* 连板效应 */
+  if (I.limitStreak >= 1) { p += 7.0; notes.push('连板动量 +7pp'); }
+  /* 跌停预警 */
+  if (I.downLimit20 >= 2) { p -= 4.0; notes.push('近期跌停 -4pp'); }
+  p = Math.round(Math.min(66, Math.max(35, p)) * 10) / 10;
+  return { prob: p, base, notes: notes.slice(0, 3) };
 }
 
 /* 海龟法则：1 单位仓位 = 账户风险预算 1% / (ATR / 价格) */
@@ -3681,7 +3729,14 @@ function cardHTML(x, mode, rank) {
     else if (ms.score <= -3) minuteMark = '<em style="color:var(--red)">VWAP' + ms.vwapDivPct + '%' + dimDate + '</em>';
     else if (ms.date) minuteMark = '<em class="dim">VWAP' + (ms.vwapDivPct >= 0 ? '+' : '') + ms.vwapDivPct + '%' + dimDate + '</em>';
   }
-  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark;
+  /* 次日方向概率（12 年条件概率实测，非预测保证） */
+  let nextDayMark = '';
+  if (m === 'short' && s.nextDay) {
+    const nd = s.nextDay;
+    const ndColor = nd.prob >= 55 ? 'var(--green)' : nd.prob >= 50 ? 'var(--yellow)' : 'var(--red)';
+    nextDayMark = '<em style="color:' + ndColor + ';font-weight:600" title="次日收阳概率（12年实测条件概率）">次日↑' + nd.prob.toFixed(0) + '%</em>';
+  }
+  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark;
   const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.setupName || '') + ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—') + (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '');
   const footLong = '长线 ' + fmt(score, 1) + ' · 趋势与质量';
   return '<article class="card ' + m + (rank <= 3 ? ' top' : '') + '" data-code="' + x.code + '">' +
