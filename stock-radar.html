@@ -3820,7 +3820,7 @@ function renderList() {
     ) + '</div>';
   }
   /* 资金面情绪行：两融杠杆（T+1）+ 涨跌停温度（实时快照） */
-  if (!search) {
+  if (!state.search) {
     const bits = [];
     if (state.margin && isNum(state.margin.chg5d)) {
       const mg = state.margin;
