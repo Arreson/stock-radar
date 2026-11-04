@@ -501,7 +501,9 @@ const state = {
   meta: {},            /* code -> {name, ind} */
   marketTotal: 0,      /* 全市场可选标的数（初筛前） */
   coverN: 0,           /* 本次深度分析的标的数 */
-  auction: { rows: [], ts: 0, frozen: false, date: '', msg: '' }
+  auction: { rows: [], ts: 0, frozen: false, date: '', msg: '' },
+  btCost: 0.3,         /* 回测双边成本（%） */
+  btRange: null        /* 回测样本区间 [起始日期, 结束日期] */
 };
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -1152,52 +1154,81 @@ function runBacktest() {
   const list = Object.values(state.data).filter(x => x.bars && x.bars.length >= 260);
   if (!list.length) return { ok: false, reason: '暂无足够数据（需先跑一次全市场扫描）' };
 
-  /* 大盘 bull20 滚动序列：用上证日线（state.indexes['sh000001']）的 MA20 位置 */
+  /* 大盘 bull20 滚动序列：上证 MA20 按「日期」对齐（不能按数组下标，个股上市晚/停牌会整体错位） */
   const idx = state.indexes && state.indexes['sh000001'];
-  const idxC = idx && idx.bars ? idx.bars.map(b => b.c) : null;
+  const idxBars = idx && idx.bars ? idx.bars : null;
+  const idxC = idxBars ? idxBars.map(b => b.c) : null;
   const idxMa20 = idxC && idxC.length >= 20 ? SMA(idxC, 20) : null;
+  const idxPosByDate = new Map();
+  if (idxBars) idxBars.forEach((b, k) => idxPosByDate.set(b.d, k));
 
+  const COST = clamp(isNum(state.btCost) ? state.btCost : 0.3, 0, 3) / 100;
   const STEP = 5;        /* 每 5 天采样一次 */
   const START = 260;     /* 信号起点：至少 260 根 bar 才能稳定计算 120/250 指标 */
   const HOLD_DAYS = [2, 3, 5];
+  const RULE_MAX = 10;   /* 规则离场：最长持有天数 */
+  const RULE_STOP = 0.07;/* 规则离场：浮亏 7% 止损 */
   /* 累加器 */
   const agg = {};
-  for (const k of Object.keys(SHORT_SETUP)) agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0] };
+  for (const k of Object.keys(SHORT_SETUP)) {
+    agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0], rN: 0, rWin: 0, rSum: 0, rHold: 0 };
+  }
 
   let totalSignals = 0;
+  let minDate = '', maxDate = '';
   for (const x of list) {
     const bars = x.bars;
     const N = bars.length;
     if (N < START + 6) continue;
     const c = bars.map(b => b.c), o = bars.map(b => b.o);
+    const ma3 = SMA(c, 3);
 
     for (let i = START; i <= N - 6; i += STEP) {
       /* 只取 bar[0..i] 做 analyze，严格防止未来函数 */
       const win = bars.slice(0, i + 1);
       const I = analyze(win);
-      /* bull20：对比上证指数 bar[i] 位置的 c 与 MA20，若该点无指数数据则保守取 bull20=true */
+      /* bull20：按日期定位该交易日在上证序列中的位置 */
       let bull20 = true;
-      if (idxC && idxMa20 && i < idxC.length && i >= 20) {
-        bull20 = idxC[i] >= idxMa20[i];
+      const idxPos = idxPosByDate.get(bars[i].d);
+      if (idxC && idxMa20 && idxPos != null && idxPos >= 20) {
+        bull20 = idxC[idxPos] >= idxMa20[idxPos];
       }
       const sk = setupKeyForInd(I, bull20);
       const op = agg[sk];
       if (!op) continue;
-      totalSignals++;
 
       /* T+1：下一日开盘买入，HOLD_DAYS 日收盘卖出；上限不越界 */
       const buy = i + 1 < N ? o[i + 1] : NaN;
       if (!isNum(buy) || buy <= 0) continue;
       let valid = true;
       for (let h = 0; h < HOLD_DAYS.length; h++) {
-        const endIdx = i + 1 + HOLD_DAYS[h];   /* 第 HOLD_DAYS[h] 日收盘 */
-        if (endIdx >= N) { valid = false; break; }
-        const sell = c[endIdx];
-        const ret = sell / buy - 1 - 0.003;     /* 扣双边 0.3% 成本 */
+        if (i + 1 + HOLD_DAYS[h] >= N) { valid = false; break; }
+      }
+      if (!valid) continue;
+
+      op.count++;
+      totalSignals++;
+      for (let h = 0; h < HOLD_DAYS.length; h++) {
+        const sell = c[i + 1 + HOLD_DAYS[h]];   /* 第 HOLD_DAYS[h] 日收盘 */
+        const ret = sell / buy - 1 - COST;      /* 扣双边成本 */
         op.sumRet[h] += ret;
         if (ret > 0) op.win[h]++;
       }
-      if (valid) op.count++;
+
+      /* 规则离场：跌破 3 日线（由上方跌破才算，避免首日就误判），或自买入价回撤 7%，最长持有 RULE_MAX 日 */
+      let exitIdx = Math.min(i + 1 + RULE_MAX, N - 1);
+      for (let k = i + 1; k <= Math.min(i + 1 + RULE_MAX, N - 1); k++) {
+        const belowMa3 = k >= 3 && isNum(ma3[k]) && isNum(ma3[k - 1]) && c[k] < ma3[k] && c[k - 1] >= ma3[k - 1];
+        if (belowMa3 || c[k] <= buy * (1 - RULE_STOP)) { exitIdx = k; break; }
+      }
+      const rret = c[exitIdx] / buy - 1 - COST;
+      op.rN++;
+      if (rret > 0) op.rWin++;
+      op.rSum += rret;
+      op.rHold += exitIdx - (i + 1);
+
+      if (!minDate || bars[i].d < minDate) minDate = bars[i].d;
+      if (bars[i].d > maxDate) maxDate = bars[i].d;
     }
   }
 
@@ -1213,13 +1244,19 @@ function runBacktest() {
       avgRet2: op.count >= 5 ? +(op.sumRet[0] / op.count * 100).toFixed(2) : 0,
       avgRet3: op.count >= 5 ? +(op.sumRet[1] / op.count * 100).toFixed(2) : 0,
       avgRet5: op.count >= 5 ? +(op.sumRet[2] / op.count * 100).toFixed(2) : 0,
+      /* 规则离场（贴近实盘的退出方式） */
+      ruleSamples: op.rN,
+      ruleWr: op.rN >= 5 ? Math.round(op.rWin / op.rN * 100) : 0,
+      ruleAvg: op.rN >= 5 ? +(op.rSum / op.rN * 100).toFixed(2) : 0,
+      ruleHold: op.rN >= 5 ? +(op.rHold / op.rN).toFixed(1) : 0,
     };
   }
   state.backtest = result;
   state.backtestTs = Date.now();
   state.backtestStocks = list.length;
   state.backtestSignals = totalSignals;
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, result })); } catch (e) {}
+  state.btRange = minDate && maxDate ? [minDate, maxDate] : null;
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1233,6 +1270,8 @@ function loadBacktest() {
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
       state.backtestSignals = p.signals;
+      if (isNum(p.cost)) state.btCost = p.cost;
+      if (p.range && p.range.length === 2) state.btRange = p.range;
       return true;
     }
   } catch (e) {}
@@ -1255,9 +1294,12 @@ function buildBacktestHTML() {
   });
   const good = rows.sort((a, b) => b.wr - a.wr);
 
-  const hasBT = S && S.samples != null;
+  const hasBT = !!(S && Object.keys(S).some(k => S[k] && S[k].samples > 0));
+  const costVal = isNum(state.btCost) ? state.btCost : 0.3;
+  const costTxt = fmt(costVal, 2).replace(/0$/, '');
+  const rangeTxt = state.btRange ? state.btRange[0] + ' → ' + state.btRange[1] : '—';
   const summary = hasBT
-    ? '<em>' + (state.backtestStocks || '—') + ' 只标的 · ' + (state.backtestSignals || '—') + ' 个信号 · ' + (state.backtestTs ? new Date(state.backtestTs).toLocaleString('zh-CN', { hour12: false }) : '') + ' 更新</em>'
+    ? '<em>' + rangeTxt + ' · ' + (state.backtestStocks || '—') + ' 只 · ' + (state.backtestSignals || '—') + ' 信号 · 成本 ' + costTxt + '% · ' + (state.backtestTs ? new Date(state.backtestTs).toLocaleString('zh-CN', { hour12: false }) : '') + '</em>'
     : '<em>尚未跑回测（首次扫描完成后可点击下面按钮运行）</em>';
 
   let rowsHTML = rows.map(r => {
@@ -1288,7 +1330,34 @@ function buildBacktestHTML() {
       '</table>';
   }
 
-  const note = '<p><b>回测说明</b>：按 T+1 下一日开盘买入，扣双边 0.3% 交易成本，统计历史上 2/3/5 日收盘卖出的胜率与均收益。每 5 个交易日采样一次信号，严格防止未来函数。样本数 < 5 的形态回退到基准值。</p>' +
+  /* 规则离场 vs 固定持有：两种口径直接对比 */
+  let ruleHTML = '';
+  if (hasBT) {
+    const okRows = rows.filter(r => S[r.key] && S[r.key].ruleSamples >= 5);
+    if (okRows.length) {
+      ruleHTML = '<h4>规则离场 vs 固定持有（3 日）</h4>' +
+        '<table class="bt">' +
+        '<thead><tr><th>形态</th><th>规则胜率</th><th>规则均收益</th><th>平均持有</th><th>固定3日胜率</th><th>固定3日均收益</th></tr></thead>' +
+        okRows.map(r => {
+          const b = S[r.key];
+          return '<tr><td>' + r.name + '</td>' +
+            '<td><b>' + b.ruleWr + '%</b></td>' +
+            '<td>' + (b.ruleAvg >= 0 ? '+' : '') + b.ruleAvg + '%</td>' +
+            '<td>' + b.ruleHold + ' 日</td>' +
+            '<td>' + b.wr3 + '%</td>' +
+            '<td>' + (b.avgRet3 >= 0 ? '+' : '') + b.avgRet3 + '%</td></tr>';
+        }).join('') +
+        '</table>';
+    }
+  }
+
+  const cfg = '<div style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;flex-wrap:wrap">' +
+    '<label for="btCost">双边成本</label>' +
+    '<input id="btCost" type="number" min="0" max="3" step="0.05" value="' + costVal + '" ' +
+    'style="width:64px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit">' +
+    '<span class="dim">%（佣金 + 印花税 + 滑点），改完点「跑一次滚动回测」生效</span></div>';
+
+  const note = '<p><b>回测说明</b>：T+1 下一日开盘买入。「固定持有」统计 2/3/5 日收盘卖出；「规则离场」为收盘跌破 3 日线或浮亏 7% 止损、最长持有 10 个交易日。每 5 个交易日采样一次信号，只用截至当日的 K 线，严格防止未来函数；牛熊状态按<b>日期</b>与上证 MA20 对齐。当前双边成本 ' + costTxt + '%。</p>' +
     '<p><b>真实胜率与硬编码基准的差异</b>：若某些形态真实胜率显著高于（或低于）基准值 <b>' + (hasBT ? '（点击下方按钮刷新可修正）' : '）') + '</b>，则意味着市场环境或标的覆盖已变化，以实时结果为准。</p>';
 
   const btn = '<div style="display:flex;gap:10px;margin-top:10px">' +
@@ -1301,7 +1370,7 @@ function buildBacktestHTML() {
     '<thead><tr><th>形态</th><th>3 日胜率</th><th>来源</th></tr></thead>' +
     '<tbody>' + rowsHTML + '</tbody>' +
     '</table>' +
-    holdHTML +
+    holdHTML + ruleHTML + cfg +
     note + btn + '</section>';
 }
 
@@ -3426,6 +3495,12 @@ function renderStrategy() {
       '<p>如需多人访问，可将该 HTML 放到任意静态空间或本地 HTTP 服务中，手机通过链接访问。</p></section>' +
     '<div class="disc"><b>免责声明：</b>本工具不提供投资顾问服务，所有评分、排序、买卖区间与止损位均为模型根据历史价量数据的机械计算结果，不代表未来收益。股市有风险，投资需谨慎。</div></div>';
   /* 滚动回测按钮事件 */
+  const ci = $('#btCost');
+  if (ci) ci.onchange = () => {
+    const v = parseFloat(ci.value);
+    state.btCost = isNum(v) ? clamp(v, 0, 3) : 0.3;
+    ci.value = state.btCost;
+  };
   const rb = $('#runBtBtn');
   if (rb) rb.onclick = async () => {
     rb.disabled = true;
