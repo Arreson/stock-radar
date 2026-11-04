@@ -201,11 +201,12 @@ canvas.spark{display:block;width:100%;height:38px}
 .watch-advice .wa-sub{color:var(--muted);font-size:10px;margin-bottom:2px}
 .watch-advice .wa-sub .anchor-edit{cursor:pointer;border-bottom:1px dashed rgba(255,255,255,.28);padding-bottom:1px}
 .watch-advice .wa-sub .anchor-edit:hover{color:var(--txt)}
-.anchor-row{display:flex;gap:6px;margin:5px 0 2px}
-.anchor-row input{flex:1;min-width:0;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;color:var(--txt);font-size:12px;padding:5px 8px;outline:none}
+.anchor-row{display:flex;flex-wrap:wrap;gap:6px;margin:5px 0 2px}
+.anchor-row input{flex:1 1 84px;min-width:0;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;color:var(--txt);font-size:12px;padding:5px 8px;outline:none}
 .anchor-row input:focus{border-color:#58a6ff}
 .anchor-row .btn{padding:4px 10px;font-size:11px}
 .watch-advice .wa-suggestion{color:var(--txt);font-size:11px;line-height:1.55}
+.watch-advice .wa-pos{font-size:10px;color:var(--muted);margin:3px 0;padding:4px 7px;background:rgba(255,255,255,.045);border-radius:6px;line-height:1.5}
 
 /* 紧凑排名行 */
 .rows{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:rgba(255,255,255,.025);margin:2px 0 4px}
@@ -516,6 +517,13 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const last = a => a[a.length - 1];
 const isNum = v => typeof v === 'number' && isFinite(v);
 const fmt = (n, d = 2) => isNum(n) ? n.toFixed(d) : '—';
+/* 金额格式：≥1 万显示"x.xx 万"，否则整数千分位 */
+const fmtMoney = n => {
+  if (!isNum(n)) return '—';
+  const a = Math.abs(n);
+  if (a >= 10000) return (n / 10000).toFixed(2) + ' 万';
+  return Math.round(n).toLocaleString('zh-CN');
+};
 const yr = n => isNum(n) ? n.toFixed(2) + '%' : '—';
 const capTxt = v => {
   if (!isNum(v) || v <= 0) return '—';
@@ -1964,6 +1972,10 @@ function watchAdvice(x, meta) {
 
   const anchor = meta && isNum(meta.anchorPrice) && meta.anchorPrice > 0 ? meta.anchorPrice : null;
   const pct = anchor != null ? (c / anchor - 1) * 100 : null;
+  /* 持仓：股数 × 成本价 */
+  const shares = meta && isNum(meta.shares) && meta.shares > 0 ? Math.round(meta.shares) : 0;
+  const mv = shares ? c * shares : 0;
+  const pnl = shares && anchor != null ? (c - anchor) * shares : 0;
 
   const ma20 = last(I.ma20), ma60 = last(I.ma60), ma120 = last(I.ma120);
   const rsi = last(I.r6);   /* RSI(6)，analyze 输出的字段名是 r6 / r14 */
@@ -1984,6 +1996,14 @@ function watchAdvice(x, meta) {
     else if (pct >= -5) { score -= 5;  risks.push('自选以来 -5%'); }
     else if (pct >= -10){ score -= 18; risks.push('自选以来 -10%'); }
     else                { score -= 30; risks.push('自选以来 -10%+ 需要重估'); }
+  }
+
+  /* —— 1b. 持仓风控（填了股数才生效）—— */
+  if (shares && pct != null) {
+    if (pct <= -8) { score -= 8; risks.push('持仓浮亏 ' + fmt(pct, 1) + '% 触发风控线'); }
+    else if (pct <= -5 && pct > -8) { score -= 3; }
+    if (pct >= 12 && isNum(last(I.ma20)) && c < last(I.ma20)) { score -= 6; risks.push('高位回落跌破 20 日线'); }
+    if (pnl >= 0 && pct >= 8 && isNum(last(I.ma20)) && c > last(I.ma20)) { score += 6; flags.push('持仓盈利且守住 20 日线'); }
   }
 
   /* —— 2. 均线多空结构 —— */
@@ -2086,6 +2106,7 @@ function watchAdvice(x, meta) {
 
   return {
     verdict, suggestion, tone, score, flags, risks, pct, anchor,
+    shares, mv, pnl,
     anchorDate: meta ? meta.anchorDate : null,
     ma20: fmt(ma20), ma60: fmt(ma60), ma120: fmt(ma120),
     rsi: isNum(rsi) ? fmt(rsi, 0) : '—',
@@ -3990,11 +4011,12 @@ function renderWatch() {
   });
 
   /* —— 汇总面板统计（用 filteredArr）—— */
-  let sumPct = 0, nPct = 0, ndUp = 0;
+  let sumPct = 0, nPct = 0, ndUp = 0, posCount = 0, totalMV = 0, totalPnl = 0;
   const counts = { '顺势持有': 0, '继续观察': 0, '观望': 0, '考虑减仓': 0, '建议止损': 0, '无锚定': 0 };
   filteredArr.forEach(o => {
     const v = o.adv;
     if (o.nd && o.nd.prob >= 55) ndUp++;
+    if (v && v.shares > 0) { posCount++; totalMV += v.mv; totalPnl += v.pnl; }
     if (!v) { counts['无锚定']++; return; }
     if (v.pct != null) { sumPct += v.pct; nPct++; }
     if (counts[v.verdict] != null) counts[v.verdict]++;
@@ -4032,6 +4054,7 @@ function renderWatch() {
     '<div style="font-size:11px;color:var(--muted);min-width:48px">自选 <b class="num" style="font-size:14px;color:var(--txt)">' + filteredArr.length + '</b>/' + arr.length + ' 只</div>' +
     '<div style="font-size:11px;color:var(--muted);min-width:60px">平均浮盈 <b class="num ' + (avgPct != null && avgPct >= 0 ? 'up' : 'down') + '" style="font-size:14px">' + (avgPct != null ? signTxt(avgPct, 1) : '—') + '</b></div>' +
     '<div style="font-size:11px;color:var(--muted);min-width:72px" title="次日收阳概率≥55%的自选数量（12年实测条件概率）">明日偏涨 <b class="num" style="font-size:14px;color:' + (ndUp > 0 ? 'var(--green)' : 'var(--dim)') + '">' + ndUp + '</b> 只</div>' +
+    (posCount ? '<div style="font-size:11px;color:var(--muted)" title="已填写持股数的标的">持仓 <b class="num" style="font-size:14px;color:var(--txt)">' + posCount + '</b> 只 · 市值 <b class="num" style="font-size:14px;color:var(--txt)">¥' + fmtMoney(totalMV) + '</b> · 浮动 <b class="num ' + (totalPnl >= 0 ? 'up' : 'down') + '" style="font-size:14px">' + (totalPnl >= 0 ? '+' : '-') + '¥' + fmtMoney(Math.abs(totalPnl)) + '</b></div>' : '') +
     clearFilterBtn +
     '</div>' +
     '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px">' +
@@ -4086,10 +4109,15 @@ function renderWatch() {
       const sigTxt = [...adv.flags, ...adv.risks].slice(0, 3).join(' · ');
       /* 次日方向概率徽章（12 年实测条件概率） */
       const ndTxt = nd ? '<span style="color:' + (nd.prob >= 55 ? 'var(--green)' : nd.prob >= 50 ? 'var(--yellow)' : 'var(--red)') + ';font-weight:600" title="次日收阳概率 · ' + (x.short.setupName || '') + (nd.notes.length ? ' · ' + nd.notes.join(' · ') : '') + '">次日↑' + nd.prob.toFixed(0) + '%</span>' : '';
+      /* 持仓行：填了股数才显示 */
+      const posRow = adv.shares > 0 ? '<div class="wa-pos">持仓 <b class="num">' + adv.shares.toLocaleString('zh-CN') + '</b> 股 · 成本 <b class="num">' + fmt(adv.anchor) + '</b> · 市值 <b class="num">¥' + fmtMoney(adv.mv) + '</b>' +
+        (totalMV > 0 ? '（' + (adv.mv / totalMV * 100).toFixed(1) + '%）' : '') +
+        ' · 浮动 <b class="num ' + (adv.pnl >= 0 ? 'up' : 'down') + '">' + (adv.pnl >= 0 ? '+' : '-') + '¥' + fmtMoney(Math.abs(adv.pnl)) + '（' + signTxt(adv.pct, 1) + '）</b></div>' : '';
       adviceRow = '<div class="watch-advice">' +
         '<div class="wa-top"><span class="wa-verdict" style="color:' + tone + '">◆ ' + adv.verdict + '</span><span class="wa-score">' + ndTxt + (ndTxt ? ' · ' : '') + '信号分 ' + (adv.score >= 0 ? '+' : '') + adv.score + (shapeTxt ? ' · ' + shapeTxt : '') + '</span></div>' +
         '<div class="wa-sub">' + anchorTxt + (pctTxt ? ' · ' + pctTxt : '') + (sigTxt ? ' · ' + sigTxt : '') + '</div>' +
         '<div class="wa-suggestion">' + adv.suggestion + '</div>' +
+        posRow +
       '</div>';
     }
 
@@ -4129,42 +4157,51 @@ function openAnchorEditor(el) {
   const x = state.data[code];
   const row = document.createElement('div');
   row.className = 'anchor-row';
-  row.innerHTML = '<input type="number" step="0.01" inputmode="decimal" placeholder="输入锚定价，如 12.34" value="' + (isNum(meta.anchorPrice) ? meta.anchorPrice : '') + '">' +
+  row.innerHTML = '<input type="number" step="0.01" inputmode="decimal" data-f="price" placeholder="成本价" value="' + (isNum(meta.anchorPrice) ? meta.anchorPrice : '') + '">' +
+    '<input type="number" step="1" min="0" inputmode="numeric" data-f="shares" placeholder="持股数" value="' + (isNum(meta.shares) && meta.shares > 0 ? meta.shares : '') + '">' +
     '<button class="btn" data-a="save">保存</button>' +
     '<button class="btn" data-a="now">现价</button>' +
     '<button class="btn" data-a="clear">清除</button>';
   el.parentNode.appendChild(row);
-  const inp = row.querySelector('input');
+  const inp = row.querySelector('[data-f="price"]');
+  const inpS = row.querySelector('[data-f="shares"]');
   setTimeout(() => { try { inp.focus(); inp.select(); } catch (e) {} }, 40);
 
-  const writeAnchor = (price, manual) => {
+  const writeAnchor = (price, shares, manual) => {
     const m = state.watchMeta[code] || { addedAt: Date.now() };
     m.anchorPrice = price;
     m.anchorDate = price ? ((x && x.bars && x.bars.length) ? x.bars[x.bars.length - 1].d : new Date().toISOString().slice(0, 10)) : '';
+    m.shares = shares || 0;
     m.manual = manual;
     state.watchMeta[code] = m;
     saveWatch();
-    toast(price ? '锚定价已设为 ' + fmt(price) + '（' + m.anchorDate + '）' : '已清除锚定价', 1400);
+    const txt = shares ? '持仓 ' + shares + ' 股 · 成本 ' + fmt(price || 0) : (price ? '锚定价已设为 ' + fmt(price) : '已清除持仓与锚定');
+    toast(txt, 1500);
     renderWatch();
   };
 
   row.querySelector('[data-a="save"]').onclick = (ev) => {
     ev.stopPropagation();
-    const v = parseFloat(inp.value);
-    if (!(v > 0)) { toast('请输入大于 0 的价格', 1300); return; }
-    writeAnchor(+v.toFixed(2), true);
+    const pv = parseFloat(inp.value);
+    const sv = Math.round(parseFloat(inpS.value) || 0);
+    if (!(pv > 0) && !(sv > 0)) { toast('请至少填写成本价或持股数', 1400); return; }
+    /* 只填股数时，成本价沿用已有锚定，否则用现价 */
+    let cost = pv > 0 ? +pv.toFixed(2) : (isNum(meta.anchorPrice) && meta.anchorPrice > 0 ? meta.anchorPrice : null);
+    if (!cost) cost = isNum(x && x.price) && x.price > 0 ? +x.price.toFixed(2) : null;
+    writeAnchor(cost, Math.max(0, sv), true);
   };
   row.querySelector('[data-a="now"]').onclick = (ev) => {
     ev.stopPropagation();
     const p = isNum(x && x.price) && x.price > 0 ? x.price : (x && x.bars && x.bars.length ? x.bars[x.bars.length - 1].c : null);
     if (!(p > 0)) { toast('暂无现价，请手动输入', 1300); return; }
-    writeAnchor(+p.toFixed(2), true);
+    const sv = Math.round(parseFloat(inpS.value) || 0) || (isNum(meta.shares) ? meta.shares : 0);
+    writeAnchor(+p.toFixed(2), sv, true);
   };
   row.querySelector('[data-a="clear"]').onclick = (ev) => {
     ev.stopPropagation();
-    writeAnchor(null, true);   /* manual=true → 之后不再自动补 */
+    writeAnchor(null, 0, true);   /* manual=true → 之后不再自动补 */
   };
-  inp.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); row.querySelector('[data-a="save"]').click(); } };
+  [inp, inpS].forEach(elm => { elm.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); row.querySelector('[data-a="save"]').click(); } }; });
 }
 
 function bindWatchFilter() {
@@ -4724,6 +4761,8 @@ function renderDetail() {
         '<div class="plan">' +
           '<div class="pr"><span>自选锚定</span><b>' + (advPanel.anchor ? fmt(advPanel.anchor) + (advPanel.anchorDate ? ' · ' + advPanel.anchorDate : '') : '未锚定') + '</b></div>' +
           '<div class="pr"><span>自选浮盈</span><b class="num ' + (advPanel.pct != null && advPanel.pct >= 0 ? 'up' : 'down') + '">' + (advPanel.pct != null ? signTxt(advPanel.pct, 2) : '—') + '</b></div>' +
+          (advPanel.shares > 0 ? '<div class="pr"><span>持股</span><b class="num">' + advPanel.shares.toLocaleString('zh-CN') + ' 股 · 市值 ¥' + fmtMoney(advPanel.mv) + '</b></div>' +
+            '<div class="pr"><span>持仓盈亏</span><b class="num ' + (advPanel.pnl >= 0 ? 'up' : 'down') + '">' + (advPanel.pnl >= 0 ? '+' : '-') + '¥' + fmtMoney(Math.abs(advPanel.pnl)) + '</b></div>' : '') +
           '<div class="pr"><span>结构</span><b>' + advPanel.structure + '</b></div>' +
           '<div class="pr"><span>RSI</span><b>' + advPanel.rsi + '</b></div>' +
           '<div class="pr"><span>MA20 / MA60</span><b>' + advPanel.ma20 + ' / ' + advPanel.ma60 + '</b></div>' +
