@@ -1264,73 +1264,63 @@ function scoreShort(x, ctx) {
     winRate: si.wr, avgRet: si.avgRet,
     hold: S.hold, samples: (state.backtest && state.backtest[setup] && state.backtest[setup].samples) || 0,
     regime: marketDown ? 'down' : 'up',
-    plan: shortPlan(x, { marketDown, setup })
+    plan: shortPlan(x, { marketDown, marketUp: ctx.marketUp, setup })
   };
 
 }
 
-/* 短线形态与回测统计（102 只样本、2021-11 → 2026-10、T+1、双边 0.3% 成本） */
+/* 短线形态基准统计：真实 scoreShort 分类、无门槛全样本实测
+   数据口径 = 12 年（2014-07 → 2026-11）· 102 只 · 49,208 样本 · T+1 下一日开盘成交 · 双边 0.3% 成本
+   wrBull/wrBear = 5 日胜率(%)；avgBull/avgBear = 5 日均收益(%) */
 const SHORT_SETUP = {
-  limitup:   { name: '连板接力', wr: 48, hold: '≤3 日', note: 'A 股独有：连续涨停 ≥2 天。牛市胜率显著高于熊市，连板龙二/龙三胜率约 40-50%' },
-  gap:       { name: '缺口突破', wr: 46, hold: '3–5 日', note: 'A 股理论：向上跳空未回补缺口（3 日内 low 未触及缺口起点），强势确认。不补率约 60%' },
-  resilient: { name: '逆势强势', wr: 45, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。牛熊双市正期望' },
-  breakout:  { name: '放量突破', wr: 45, hold: '3–5 日', note: '突破 20 日新高且量能放大。仅牛市正期望（牛市 5 日均 +0.39%），熊市追高被套已从熊市白名单剔除' },
-  kdj:       { name: 'KDJ 拐点', wr: 45, hold: '≤3 日', note: '低位金叉，熊市 5 日均 +0.15% 牛市 -0.15%。熊市白名单' },
-  bounce:    { name: '超卖反弹', wr: 48, hold: '≤3 日', note: 'KDJ/J 与 RSI6 同时超卖 + MACD 绿柱收敛。仅熊市正期望（熊市 5 日均 +0.30%）' },
-  trend:     { name: '趋势延续', wr: 45, hold: '5–10 日', note: '均线多头但未突破。牛熊双市正期望（熊市 5 日均 +0.51%、牛市 +0.13%）' },
-  weak:      { name: '弱势反抽', wr: 46, hold: '≤3 日（熊市）/ 回避（牛市）', note: '中期均线未站上，牛市 -0.27% 熊市 +0.35%，仅熊市白名单' }
+  limitup:   { name: '连板接力', wrBull: 45, wrBear: 50, avgBull: -0.20, avgBear: 0.50, hold: '≤3 日', note: 'A 股独有：连续涨停 ≥2 天。样本稀少（牛市 28 / 熊市 8），低于 30 样本门槛，暂列低置信' },
+  gap:       { name: '缺口突破', wrBull: 41, wrBear: 51, avgBull: -2.21, avgBear: 1.06, hold: '3–5 日', note: 'A 股缺口理论：向上跳空 3 日未回补。熊市 +1.06% 正期望，牛市追缺口 -2.21% 已剔除' },
+  resilient: { name: '逆势强势', wrBull: 50, wrBear: 50, avgBull: 0.58, avgBear: 0.58, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。熊市实测 +0.58%，期望最高' },
+  breakout:  { name: '放量突破', wrBull: 46, wrBear: 49, avgBull: 0.25, avgBear: -0.35, hold: '3–5 日', note: '突破 20 日新高且量能放大。牛市 +0.25%，熊市 -0.35% 追高被套已剔除' },
+  kdj:       { name: 'KDJ 拐点', wrBull: 46, wrBear: 48, avgBull: 0.01, avgBear: -0.07, hold: '≤3 日', note: '低位金叉。两市期望≈0（熊市 -0.07%），无统计优势，已剔除白名单' },
+  bounce:    { name: '超卖反弹', wrBull: 43, wrBear: 51, avgBull: -0.51, avgBear: 0.24, hold: '≤3 日', note: '超卖 + MACD 绿柱收敛。熊市 51%/+0.24%，牛市 -0.51% 已剔除' },
+  trend:     { name: '趋势延续', wrBull: 46, wrBear: 49, avgBull: 0.14, avgBear: 0.29, hold: '5–10 日', note: '均线多头但未突破。牛熊双市正期望（+0.14% / +0.29%），最稳形态' },
+  weak:      { name: '弱势反抽', wrBull: 44, wrBear: 51, avgBull: -0.40, avgBear: 0.42, hold: '≤3 日（熊市）/ 回避（牛市）', note: '中期均线未站上。熊市 +0.42% 正期望，牛市 -0.40% 仅熊市白名单' }
 };
 
-/* 形态白名单：自适应市场环境 ——
-   牛市（上证在 MA20 上方）选 breakout + trend + limitup + resilient（A 股连板牛市效应强）；
-   熊市（上证在 MA20 下方）选 weak + trend + bounce + kdj + gap（超跌反弹/弱势反抽/缺口接力胜率更高）。
-   注：gap 牛市实测 -0.80% 负期望（134 样本，牛市追缺口被套），已从牛市白名单剔除。 */
-const SHORT_WHITELIST_BULL = { breakout: true, trend: true, resilient: true, limitup: true, gap: false, bounce: false, kdj: false, weak: false };
-const SHORT_WHITELIST_BEAR = { weak: true, trend: true, bounce: true, kdj: true, resilient: true, limitup: true, gap: true, breakout: false };
+/* 形态白名单：按 12 年实测净期望分池（成本已计入）——
+   熊市（上证在 MA20 下方）：resilient +0.58% / gap +1.06% / weak +0.42% / trend +0.29% / bounce +0.24%
+   牛市（上证在 MA20 上方）：breakout +0.25% / trend +0.14%
+   剔除依据：kdj 熊 -0.07% / gap 牛 -2.21% / breakout 熊 -0.35% / weak 牛 -0.40% / bounce 牛 -0.51%；
+   limitup 牛 28 样本、熊 8 样本，低于 30 样本门槛 → 不进白名单（仍会标注形态，但不入推荐） */
+const SHORT_WHITELIST_BULL = { breakout: true, trend: true, resilient: true, limitup: false, gap: false, bounce: false, kdj: false, weak: false };
+const SHORT_WHITELIST_BEAR = { weak: true, bounce: true, trend: true, resilient: true, gap: true, limitup: false, kdj: false, breakout: false };
 function shortWhitelistFor(bull) { return bull === true ? SHORT_WHITELIST_BULL : SHORT_WHITELIST_BEAR; }
 /* 同股票冷却期：上次出现任一短线 setup 后 N 天内不再重复提示（减少同一下跌反复计入） */
 const SHORT_COOLDOWN_DAYS = 20;
 
-/* 滚动回测默认值（首次运行或样本不足时回落） —— 已用 11 年实测替换 */
-const BACKTEST_DEFAULTS = {
-  limitup:   { wr: 48, avgRet: 0.50, samples: 0 },
-  gap:       { wr: 46, avgRet: 0.20, samples: 0 },
-  resilient: { wr: 45, avgRet: 0.19, samples: 0 },
-  breakout:  { wr: 45, avgRet: 0.10, samples: 0 },
-  kdj:       { wr: 45, avgRet: -0.10, samples: 0 },
-  bounce:    { wr: 48, avgRet: 0.00, samples: 0 },
-  trend:     { wr: 45, avgRet: -0.03, samples: 0 },
-  weak:      { wr: 46, avgRet: -0.08, samples: 0 }
-};
-
-/* —— 简化版 setup 判定（仅依赖 analyze 返回的 ind 字段 + 大盘方向） —— */
-function setupKeyForInd(I, bull20) {
-  const c = last(I.c), K = last(I.K), D = last(I.D), J = last(I.J);
+/* —— 形态归类（唯一实现）：回测引擎与实盘 scoreShort 共用同一套判定，避免双轨口径 —— */
+function classifySetup(I, x, ctx) {
+  ctx = ctx || {};
+  const c = last(I.c), J = last(I.J);
   const r6 = last(I.r6), hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
   const s20 = slope(I.ma20, 20);
-  const slopeUp = s20 > 0;
   const aboveMa20 = c > last(I.ma20);
   const aboveMa60 = isNum(last(I.ma60)) && c > last(I.ma60);
-  const uptrend = slopeUp && aboveMa20;
+  const uptrend = s20 > 0 && aboveMa20;          /* 原文 slopeUp && aboveMa20 */
   const oversold = J < 30 && r6 < 35;
   const gd = goldenDays(I.K, I.D);
   const vr = last(I.vol5) > 0 ? last(I.v) / last(I.vol5) : 1;
   const hit20 = Math.max(...I.h.slice(-21, -1));
-  const marketDown = !bull20;
+  const marketDown = ctx.marketUp === false;
+  const sector = x && x.sector;
+  /* resilient：大盘下行、个股仍多头 + 行业不弱（回测无行业数据时 secUp 缺省视为不弱） */
+  const resilient = marketDown && uptrend && aboveMa60 && I.ret20 > 0 && (!ctx.secUp || !sector || ctx.secUp[sector] !== false);
 
-  let setup;
   /* ★ A 股独有形态优先判定：连板 > 缺口 > 原有形态 */
-  if (I.limitStreak >= 2 && aboveMa20) setup = 'limitup';        /* 连板接力：连续涨停 + 站上 MA20 */
-  else if (I.gapTrend > 0 && uptrend) setup = 'gap';            /* 向上未补缺口 + 多头 */
-  /* resilient：大盘下行、个股仍多头（简化掉 ctx.secUp，回测没有行业数据） */
-  else if (marketDown && uptrend && aboveMa60 && I.ret20 > 0 && vr >= 1.1) setup = 'resilient';
-  else if (c >= hit20 * 0.995 && (vr >= 1.1 || I.brkVol >= 1.5)) setup = 'breakout';
-  else if (oversold && (gd >= 0 && gd <= 3 || (hist < 0 && hist > histPrev))) setup = 'bounce';
-  else if (gd >= 0 && gd <= 3) setup = 'kdj';
-  else if (uptrend) setup = 'trend';
-  else if (slopeUp || aboveMa20) setup = 'weak';
-  else setup = 'weak';
-  return setup;
+  if (I.limitStreak >= 2 && aboveMa20) return 'limitup';   /* 连板接力：连续涨停 + 站上 MA20 */
+  if (I.gapTrend > 0 && uptrend) return 'gap';             /* 向上未补缺口 + 多头 */
+  if (resilient && vr >= 1.1) return 'resilient';
+  if (c >= hit20 * 0.995 && (vr >= 1.1 || I.brkVol >= 1.5)) return 'breakout';
+  if (oversold && (gd >= 0 && gd <= 3 || (hist < 0 && hist > histPrev))) return 'bounce';
+  if (gd >= 0 && gd <= 3) return 'kdj';
+  if (uptrend) return 'trend';
+  return 'weak';
 }
 
 /* —— 滚动回测引擎 ——
@@ -1355,10 +1345,11 @@ function runBacktest() {
   const RULE_MAX = 10;   /* 规则离场：最长持有天数 */
   const RULE_STOP = 0.07;/* 规则离场：浮亏 7% 止损 */
   const TP_LEVELS = [0.05, 0.08]; /* 主动止盈：盘中触及 +5% / +8% 即按止盈价卖出 */
-  /* 累加器 */
+  /* 累加器（含牛/熊分池：实盘卡片按当前市场状态取对应池的胜率） */
+  const mkReg = () => ({ n: 0, win: [0, 0, 0], sum: [0, 0, 0] });
   const agg = {};
   for (const k of Object.keys(SHORT_SETUP)) {
-    agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0], rN: 0, rWin: 0, rSum: 0, rHold: 0, tpN: 0, tpWin: [0, 0], tpSum: [0, 0] };
+    agg[k] = { count: 0, win: [0, 0, 0], sumRet: [0, 0, 0], rN: 0, rWin: 0, rSum: 0, rHold: 0, tpN: 0, tpWin: [0, 0], tpSum: [0, 0], reg: { bull: mkReg(), bear: mkReg() } };
   }
 
   let totalSignals = 0;
@@ -1380,7 +1371,7 @@ function runBacktest() {
       if (idxC && idxMa20 && idxPos != null && idxPos >= 20) {
         bull20 = idxC[idxPos] >= idxMa20[idxPos];
       }
-      const sk = setupKeyForInd(I, bull20);
+      const sk = classifySetup(I, x, { marketUp: bull20 });
       const op = agg[sk];
       if (!op) continue;
 
@@ -1395,11 +1386,15 @@ function runBacktest() {
 
       op.count++;
       totalSignals++;
+      const rg = bull20 ? op.reg.bull : op.reg.bear;
+      rg.n++;
       for (let h = 0; h < HOLD_DAYS.length; h++) {
         const sell = c[i + 1 + HOLD_DAYS[h]];   /* 第 HOLD_DAYS[h] 日收盘 */
         const ret = sell / buy - 1 - COST;      /* 扣双边成本 */
         op.sumRet[h] += ret;
         if (ret > 0) op.win[h]++;
+        rg.sum[h] += ret;
+        if (ret > 0) rg.win[h]++;
       }
 
       /* 规则离场：跌破 3 日线（由上方跌破才算，避免首日就误判），或自买入价回撤 7%，最长持有 RULE_MAX 日 */
@@ -1458,6 +1453,11 @@ function runBacktest() {
       tp5Avg: op.tpN >= 5 ? +(op.tpSum[0] / op.tpN * 100).toFixed(2) : 0,
       tp8Wr: op.tpN >= 5 ? Math.round(op.tpWin[1] / op.tpN * 100) : 0,
       tp8Avg: op.tpN >= 5 ? +(op.tpSum[1] / op.tpN * 100).toFixed(2) : 0,
+      /* 牛/熊分池（wr、avg 按 2/3/5 日顺序） */
+      reg: {
+        bull: op.reg.bull.n >= 5 ? { n: op.reg.bull.n, wr: op.reg.bull.win.map((w, h) => +(w / op.reg.bull.n * 100).toFixed(1)), avg: op.reg.bull.sum.map(s => +(s / op.reg.bull.n * 100).toFixed(2)) } : null,
+        bear: op.reg.bear.n >= 5 ? { n: op.reg.bear.n, wr: op.reg.bear.win.map((w, h) => +(w / op.reg.bear.n * 100).toFixed(1)), avg: op.reg.bear.sum.map(s => +(s / op.reg.bear.n * 100).toFixed(2)) } : null
+      },
     };
   }
   state.backtest = result;
@@ -1636,7 +1636,7 @@ function loadBacktest() {
   return false;
 }
 
-/* 取 setup 的当前胜率：优先 state.backtest → 回落 SHORT_SETUP → 回落 BACKTEST_DEFAULTS */
+/* 取 setup 的当前胜率：优先 state.backtest → 回落 12 年实测基准 */
 /* 构建策略页里的滚动回测面板 HTML */
 function buildBacktestHTML() {
   const S = state.backtest;
@@ -1644,9 +1644,9 @@ function buildBacktestHTML() {
   const rows = Object.keys(DEFAULTS).map(k => {
     const bt = S && S[k] && S[k].samples >= 5 ? S[k] : null;
     const d = DEFAULTS[k];
-    /* wr: 真实回测优先，没有则回落硬编码 */
-    const wr = bt ? bt.wr3 : d.wr;
-    const avgRet = bt ? bt.avgRet3 : null;
+    /* wr：浏览器回测（当前市场池）优先；未回测则回落 12 年实测基准 */
+    const wr = wrFor(k, 3, state.marketUp);
+    const avgRet = avgRetFor(k, 3, state.marketUp);
     const samples = bt ? bt.samples : 0;
     return { key: k, name: d.name, hold: d.hold, wr, avgRet, samples, bt };
   });
@@ -1661,7 +1661,7 @@ function buildBacktestHTML() {
     : '<em>尚未跑回测（首次扫描完成后可点击下面按钮运行）</em>';
 
   let rowsHTML = rows.map(r => {
-    const sampleInfo = r.bt ? '<span class="dim">· ' + r.samples + ' 样本</span>' : '<span class="dim">· 默认值（未回测）</span>';
+    const sampleInfo = r.bt ? '<span class="dim">· ' + r.samples + ' 样本</span>' : '<span class="dim">· 12 年基准</span>';
     const retInfo = r.avgRet != null ? ' · 均 ' + (r.avgRet >= 0 ? '+' : '') + fmt(r.avgRet, 2) + '%' : '';
     return '<tr>' +
       '<td><b>' + r.name + '</b><div class="dim" style="font-size:9px">' + DEFAULTS[r.key].hold + '</div></td>' +
@@ -1796,59 +1796,38 @@ function buildLongBacktestHTML() {
     sum + year + note + cfg + '</section>';
 }
 
-function wrFor(setup, holdDays) {
+/* 胜率/均收益：优先用当前浏览器回测（牛熊分池），否则回落 12 年实测基准（按牛熊分池） */
+const HOLD_IDX = h => (h === 2 ? 0 : h === 3 ? 1 : 2);
+function btPool(setup, marketUp) {
   const bt = state.backtest && state.backtest[setup];
-  if (bt && bt.samples >= 5) {
-    if (holdDays === 2) return bt.wr2;
-    if (holdDays === 3) return bt.wr3;
-    if (holdDays === 5) return bt.wr5;
-  }
-  return (SHORT_SETUP[setup] && SHORT_SETUP[setup].wr) || (BACKTEST_DEFAULTS[setup] && BACKTEST_DEFAULTS[setup].wr) || 45;
+  if (!bt || bt.samples < 5) return null;
+  const r = bt.reg && (marketUp === false ? bt.reg.bear : bt.reg.bull);
+  if (r && r.n >= 5) return r;
+  return { n: bt.samples, wr: [bt.wr2, bt.wr3, bt.wr5], avg: [bt.avgRet2, bt.avgRet3, bt.avgRet5] };
 }
-function avgRetFor(setup, holdDays) {
-  const bt = state.backtest && state.backtest[setup];
-  if (bt && bt.samples >= 5) {
-    if (holdDays === 2) return bt.avgRet2;
-    if (holdDays === 3) return bt.avgRet3;
-    if (holdDays === 5) return bt.avgRet5;
-  }
-  return (BACKTEST_DEFAULTS[setup] && BACKTEST_DEFAULTS[setup].avgRet) || 0.2;
+function wrFor(setup, holdDays, marketUp) {
+  const pool = btPool(setup, marketUp);
+  if (pool) return pool.wr[HOLD_IDX(holdDays)];
+  const d = SHORT_SETUP[setup] || SHORT_SETUP.weak;
+  return marketUp === false ? d.wrBear : d.wrBull;
+}
+function avgRetFor(setup, holdDays, marketUp) {
+  const pool = btPool(setup, marketUp);
+  if (pool) return pool.avg[HOLD_IDX(holdDays)];
+  const d = SHORT_SETUP[setup] || SHORT_SETUP.weak;
+  return marketUp === false ? d.avgBear : d.avgBull;
 }
 
-/* 简化版：scoreShort 里也复用 setupKeyForInd 与真实回测胜率 */
+/* 实盘形态归类 + 胜率参考（形态判定与回测引擎共用 classifySetup） */
 function setupInfoForShort(x, ctx) {
-  const I = x.ind;
-  const c = last(I.c);
-  const J = last(I.J), r6 = last(I.r6);
-  const K = last(I.K), D = last(I.D), hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
-  const vr = last(I.vol5) > 0 ? last(I.v) / last(I.vol5) : 1;
-  const s20 = slope(I.ma20, 20);
-  const slopeUp = s20 > 0;
-  const aboveMa20 = c > last(I.ma20);
-  const aboveMa60 = isNum(last(I.ma60)) && c > last(I.ma60);
-  const uptrend = slopeUp && aboveMa20;
-  const oversold = J < 30 && r6 < 35;
-  const gd = goldenDays(I.K, I.D);
-  const hit20 = Math.max(...I.h.slice(-21, -1));
-  const marketDown = ctx.marketUp === false;
-  /* 兼容原有 resilient 定义：含行业条件（ctx.secUp），setupKeyForInd 简化掉行业，这里在 scoreShort 原位置保留完整版 */
-  const resilient = marketDown && uptrend && aboveMa60 && I.ret20 > 0 && (!ctx.secUp || ctx.secUp[x.sector] !== false);
-
-  let setup;
-  /* ★ A 股独有形态优先判定：连板 > 缺口 > 原有形态（与 setupKeyForInd 保持一致） */
-  if (I.limitStreak >= 2 && aboveMa20) setup = 'limitup';
-  else if (I.gapTrend > 0 && uptrend) setup = 'gap';
-  else if (resilient && vr >= 1.1) setup = 'resilient';
-  else if (c >= hit20 * 0.995 && (vr >= 1.1 || I.brkVol >= 1.5)) setup = 'breakout';
-  else if (oversold && (gd >= 0 && gd <= 3 || (hist < 0 && hist > histPrev))) setup = 'bounce';
-  else if (gd >= 0 && gd <= 3) setup = 'kdj';
-  else if (uptrend) setup = 'trend';
-  else if (slopeUp || aboveMa20) setup = 'weak';
-  else setup = 'weak';
-
-  /* 回测引擎跑出来的真实胜率（优先 3 日持有） */
-  const wr = wrFor(setup, 3);
-  const avgRet = avgRetFor(setup, 3);
+  const I = x.ind, c = last(I.c);
+  const setup = classifySetup(I, x, ctx);
+  /* resilient 打分口径（不含量能确认，与历史 scoreShort 权重一致）：仅用于 scoreShort 的降权判断 */
+  const resilient = ctx.marketUp === false && slope(I.ma20, 20) > 0 && c > last(I.ma20) &&
+    isNum(last(I.ma60)) && c > last(I.ma60) && I.ret20 > 0 &&
+    (!ctx.secUp || !x.sector || ctx.secUp[x.sector] !== false);
+  const wr = wrFor(setup, 3, ctx.marketUp);
+  const avgRet = avgRetFor(setup, 3, ctx.marketUp);
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
   return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, hold: S.hold, resilient };
 }
@@ -1907,7 +1886,7 @@ function shortPlan(x, o) {
   /* 仓位：ATR 单位（1% 风险）与半凯利取较小值；凯利为 0 表示负期望，只给 3% 试探仓 */
   const payoff = setupKey === 'resilient' ? 1.6 : setupKey === 'breakout' ? 1.5 : 1.2;
   const atrUnit = atrUnitPos(x, 1) || 15;
-  const realWr = wrFor(setupKey, 3);
+  const realWr = wrFor(setupKey, 3, o.marketUp !== false);
   const kelly = kellyPos(realWr, payoff);
   let pos = Math.min(atrUnit, kelly > 0 ? kelly : 3);
   if (o.marketDown) pos = Math.round(Math.max(2, pos * 0.6));
