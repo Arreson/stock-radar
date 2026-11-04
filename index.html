@@ -1062,21 +1062,19 @@ function scoreShort(x, ctx) {
      下行市场“逆势强势”结构 53% 胜率保留；
      其余非逆势但技术形态尚可的标的，给予 0.55 系数、上限 58，避免分数集体归零 */
   let rawFinal = raw;
-  /* 放量反弹黄金信号：熊市但大盘相对放量（MA60 下 + 量 ≥ 1.1×20日均），回测 5 日胜率 53.2% / +0.77% */
-  if (ctx.bearGold) { rawFinal += 5; reasons.push('放量反弹·黄金信号'); }
-  /* 缩量阴跌降权：熊市且量能持续萎缩，这段时段 5 日均 -0.4% */
-  if (ctx.bearTight) { rawFinal -= 4; if (typeof risks !== 'undefined') risks.push('缩量阴跌中，谨慎入场'); }
 
   const score = marketDown
     ? clamp(Math.min(resilient ? rawFinal * 0.95 : rawFinal * 0.55, resilient ? 85 : 58), 0, 100)
     : clamp(rawFinal, 0, 100);
 
-  /* 形态归类 + 回测统计（用于卡片与详情的“胜率参考”） */
+  /* 形态归类 + 回测统计（用于卡片与详情的"胜率参考"） */
   const si = setupInfoForShort(x, ctx);
   const setup = si.setup;
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
 
   const reasons = [];
+  if (ctx.bearGold) { rawFinal += 5; reasons.push('放量反弹·黄金信号'); }
+  if (ctx.bearTight) { rawFinal -= 4; risks.push('缩量阴跌中，谨慎入场'); }
   if (setup === 'resilient') reasons.push('逆势强势');
   if (gd >= 0 && gd <= 3) reasons.push('KDJ金叉' + (gd === 0 ? '当日' : gd + '日前'));
   else if (J < 25) reasons.push('KDJ超卖 ' + fmt(J, 0));
