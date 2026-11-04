@@ -1101,22 +1101,27 @@ function scoreShort(x, ctx) {
 
 /* 短线形态与回测统计（102 只样本、2021-11 → 2026-10、T+1、双边 0.3% 成本） */
 const SHORT_SETUP = {
-  resilient: { name: '逆势强势', wr: 53, hold: '3–5 日', note: '大盘下行仍站上 20/60 日线、20 日为正、行业向上、温和放量' },
-  breakout: { name: '放量突破', wr: 46, hold: '3–5 日', note: '突破 20 日新高且量能放大，5 日均收益最佳' },
-  kdj: { name: 'KDJ 拐点', wr: 47, hold: '3–5 日', note: '低位金叉配合行业向上，需快进快出' },
-  bounce: { name: '超卖反弹', wr: 44, hold: '2–3 日', note: 'KDJ/J 与 RSI6 同时超卖，配合 MACD 绿柱收敛，属底部博弈' },
-  trend: { name: '趋势延续', wr: 42, hold: '3 日', note: '趋势虽向上但未突破，胜率一般，只宜轻仓试探' },
-  weak: { name: '弱势反抽', wr: 46, hold: '≤2 日', note: '中期均线未站上，反弹持续性差，需严格止损' }
+  resilient: { name: '逆势强势', wr: 45, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。11 年实测 5 日均 +0.35%，胜率 46%' },
+  breakout: { name: '放量突破', wr: 45, hold: '3–5 日', note: '突破 20 日新高且量能放大。实测 3 日均 +0.10%，5 日均 +0.26%' },
+  kdj: { name: 'KDJ 拐点', wr: 45, hold: '≤3 日', note: '低位金叉，需快进快出。实测 3 日均 -0.10% 负期望，轻仓或回避' },
+  bounce: { name: '超卖反弹', wr: 48, hold: '≤3 日', note: 'KDJ/J 与 RSI6 同时超卖 + MACD 绿柱收敛。实测 3 日均 0%，博弈属性' },
+  trend: { name: '趋势延续', wr: 45, hold: '5–10 日', note: '均线多头但未突破。3 日均 -0.03%、5 日均 +0.25%，需持有更久' },
+  weak: { name: '弱势反抽', wr: 46, hold: '≤2 日 / 回避', note: '中期均线未站上，11 年 3 日均 -0.08% 负期望，默认白名单剔除' }
 };
 
-/* 滚动回测默认值（首次运行或样本不足时回落） */
+/* 形态白名单：核心面板默认只显示 3/5 日口径正期望的形态 */
+const SHORT_WHITELIST = { resilient: true, breakout: true, bounce: false, kdj: false, trend: false, weak: false };
+/* 同股票冷却期：上次出现任一短线 setup 后 N 天内不再重复提示（减少同一下跌反复计入） */
+const SHORT_COOLDOWN_DAYS = 20;
+
+/* 滚动回测默认值（首次运行或样本不足时回落） —— 已用 11 年实测替换 */
 const BACKTEST_DEFAULTS = {
-  resilient: { wr: 53, avgRet: 1.2, samples: 0 },
-  breakout:  { wr: 46, avgRet: 0.8, samples: 0 },
-  kdj:       { wr: 47, avgRet: 0.6, samples: 0 },
-  bounce:    { wr: 44, avgRet: 0.4, samples: 0 },
-  trend:     { wr: 42, avgRet: 0.5, samples: 0 },
-  weak:      { wr: 46, avgRet: 0.3, samples: 0 }
+  resilient: { wr: 45, avgRet: 0.19, samples: 0 },
+  breakout:  { wr: 45, avgRet: 0.10, samples: 0 },
+  kdj:       { wr: 45, avgRet: -0.10, samples: 0 },
+  bounce:    { wr: 48, avgRet: 0.00, samples: 0 },
+  trend:     { wr: 45, avgRet: -0.03, samples: 0 },
+  weak:      { wr: 46, avgRet: -0.08, samples: 0 }
 };
 
 /* —— 简化版 setup 判定（仅依赖 analyze 返回的 ind 字段 + 大盘方向） —— */
@@ -1260,6 +1265,155 @@ function runBacktest() {
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
+/* —— 长期持有策略回测 ——
+   每 STEP 天调仓一次：按 scoreLong 对所有股票打分取前 TOPN 名，
+   T+1 开盘买入，固定持有 HOLD 天收盘卖出，双边按 state.btCost 扣费。
+   防未来函数：每只股票的 ind 与指数 bars 都只看截至当日。
+   估值与行业排名中性化（pe=20/pb=3/mcap=500/secRank=0.5），
+   只让技术面 + 相对强度 + 趋势稳定 + 量能资金部分生效。
+   输出 3 条错开 lane 的组合资金曲线 + 逐年统计。 */
+function runLongBacktest() {
+  const list = Object.values(state.data).filter(x => x.bars && x.bars.length >= 260);
+  const idx = state.indexes && state.indexes['sh000001'];
+  const idxBars = idx && idx.bars ? idx.bars : null;
+  if (!list.length || !idxBars) return { ok: false, reason: '暂无足够数据' };
+
+  const COST = clamp(isNum(state.btCost) ? state.btCost : 0.3, 0, 3) / 100;
+  const TOPN = 10, HOLD = 60, STEP = 20, START = 260;
+  const N = idxBars.length;
+  const minDate = idxBars[START] && idxBars[START].d, maxDate = idxBars[N - 1] && idxBars[N - 1].d;
+
+  const codes = list.map(x => x.code);
+  /* 先给每只股票建日期 -> 在 bars 中的位置（应对个股停牌/上市时间差异）*/
+  const datePos = {};
+  for (const x of list) {
+    const m = {}; x.bars.forEach((b, i) => m[b.d] = i); datePos[x.code] = m;
+  }
+
+  const trades = [];
+  const tranches = [];
+  const yearly = {};
+
+  for (let i = START; i + HOLD + 1 < N; i += STEP) {
+    const day = idxBars[i].d;
+    /* 指数 bars 截断到当日 —— scoreLong 内部算 mktRet60 会读 state.indexes */
+    state.indexes = { sh000001: { bars: idxBars.slice(0, i + 1) } };
+
+    const scored = [];
+    const candidates = [];
+    for (const x of list) {
+      const j = datePos[x.code] && datePos[x.code][day];
+      if (j == null || j < 250) continue;
+      if (j + 1 + HOLD >= x.bars.length) continue;
+      candidates.push({ x, j });
+    }
+    if (candidates.length < TOPN * 3) continue;
+
+    /* 为每个候选算 ind（只看 bars[0..j]），同时收集横截面数组 */
+    const ctx = { ret60: [], ret120: [], r2: [], mdd: [], vol: [], secRank: {}, secUp: {} };
+    for (const c of candidates) {
+      const bars = c.x.bars.slice(0, c.j + 1);
+      const I = analyze(bars);
+      c.I = I;
+      ctx.ret60.push(I.ret60);
+      ctx.ret120.push(I.ret120);
+      ctx.r2.push(I.r2);
+      ctx.mdd.push(I.mdd);
+      ctx.vol.push(I.volAnn);
+    }
+
+    for (const c of candidates) {
+      /* 估值 + 行业排名全部中性化，防未来函数 */
+      const fakeX = { ind: c.I, sector: c.x.sector, pe: 20, pb: 3, mcap: 500 };
+      const s = scoreLong(fakeX, ctx);
+      c.score = s.score;
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const picks = candidates.slice(0, TOPN);
+
+    let sum = 0, win = 0, n = 0;
+    for (const p of picks) {
+      const bars = p.x.bars;
+      const buy = bars[p.j + 1].o;
+      const sell = bars[p.j + 1 + HOLD].c;
+      if (!(buy > 0) || !(sell > 0)) continue;
+      const r = sell / buy - 1 - COST;
+      const year = +day.slice(0, 4);
+      if (!yearly[year]) yearly[year] = { n: 0, win: 0, sum: 0 };
+      yearly[year].n++; yearly[year].sum += r; if (r > 0) yearly[year].win++;
+      trades.push({ d: day, code: p.x.code, r });
+      sum += r; n++;
+    }
+    if (n) tranches.push({ d: day, r: sum / n, n });
+  }
+
+  if (!tranches.length) return { ok: false, reason: '长期回测信号不足（至少需 80 天以上日线）' };
+
+  /* 三条错开 lane（间隔 STEP 天，总持仓 = 3 × TOPN）*/
+  const lanes = [[], [], []];
+  tranches.forEach((t, k) => lanes[k % 3].push(t));
+
+  let best = -Infinity, worst = Infinity, peak = 100;
+  const eqByLane = lanes.map(L => {
+    let eq = 100, maxDd = 0;
+    for (const t of L) {
+      eq *= 1 + t.r;
+      if (eq > peak) peak = eq;
+      const dd = (peak - eq) / peak;
+      if (dd > maxDd) maxDd = dd;
+    }
+    return eq;
+  });
+  const startEq = 100, finalEq = eqByLane.reduce((a, b) => a + b, 0) / eqByLane.length;
+  const years = (idxBars[N - 1].d.slice(0, 4) - idxBars[START].d.slice(0, 4)) + ((idxBars[N - 1].d.slice(5) >= idxBars[START].d.slice(5)) ? 0 : -1) + 1;
+  const cagr = Math.pow(finalEq / startEq, 1 / Math.max(years, 1)) - 1;
+
+  const allRs = trades.map(t => t.r);
+  const idxC = idxBars.map(b => b.c);
+  const idxRet = idxC[N - 1] / idxC[START] - 1;
+
+  const out = {
+    ok: true,
+    range: [minDate, maxDate],
+    topN: TOPN, hold: HOLD, step: STEP, cost: COST * 100,
+    trades: trades.length, tranches: tranches.length,
+    summary: {
+      wr: +(trades.filter(t => t.r > 0).length / trades.length * 100).toFixed(1),
+      avg: +(allRs.reduce((a, b) => a + b, 0) / allRs.length * 100).toFixed(2),
+      best: +(Math.max(...allRs) * 100).toFixed(1),
+      worst: +(Math.min(...allRs) * 100).toFixed(1),
+      cagr: +(cagr * 100).toFixed(2),
+      idxRet: +(idxRet * 100).toFixed(1),
+      excess: +((cagr - idxRet / Math.max(years, 1)) * 100).toFixed(2),
+      finalEquity: +finalEq.toFixed(1),
+    },
+    yearly: {},
+  };
+  for (const y of Object.keys(yearly).sort()) {
+    const v = yearly[y];
+    out.yearly[y] = { samples: v.n, wr: +(v.win / v.n * 100).toFixed(1), avg: +(v.sum / v.n * 100).toFixed(2) };
+  }
+
+  state.longBacktest = out;
+  state.longBtTs = Date.now();
+  try { localStorage.setItem('qr_long_backtest', JSON.stringify({ ts: state.longBtTs, cost: state.btCost, topN: TOPN, hold: HOLD, step: STEP, range: [minDate, maxDate], result: out })); } catch (e) {}
+  return out;
+}
+
+function loadLongBacktest() {
+  try {
+    const raw = localStorage.getItem('qr_long_backtest');
+    if (!raw) return false;
+    const p = JSON.parse(raw);
+    if (p && p.result && (Date.now() - p.ts) < 86400000) {
+      state.longBacktest = p.result;
+      state.longBtTs = p.ts;
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 function loadBacktest() {
   try {
     const raw = localStorage.getItem('qr_backtest');
@@ -1372,6 +1526,46 @@ function buildBacktestHTML() {
     '</table>' +
     holdHTML + ruleHTML + cfg +
     note + btn + '</section>';
+}
+
+/* —— 长期持有策略回测面板 —— */
+function buildLongBacktestHTML() {
+  const B = state.longBacktest;
+  const hasBT = !!(B && B.summary);
+  const cfg = '<div style="display:flex;gap:10px;margin-top:10px">' +
+    '<button class="btn" id="runLongBtBtn" style="flex:1">跑一次长期回测（前10名·60日·20日调仓）</button>' +
+    '<button class="btn" id="clearLongBtBtn" style="flex:0 0 auto">清除</button>' +
+    '</div>';
+
+  if (!hasBT) {
+    return '<section><h3>长期持有策略回测 <em>LONG HOLD · 60 DAYS</em> <em style="color:var(--muted);font-size:11px">尚未跑过（需先跑完全市场扫描）</em></h3>' +
+      '<p class="dim">每 20 天按 scoreLong 打分取前 10，T+1 开盘买入、固定持有 60 天收盘卖出。估值与行业排名中性化（防未来函数），双边成本 ' + (isNum(state.btCost) ? state.btCost : 0.3) + '%。三条错开 lane 模拟连续持仓。</p>' + cfg + '</section>';
+  }
+
+  const s = B.summary;
+  const rangeTxt = B.range ? B.range[0] + ' → ' + B.range[1] : '—';
+  const sum = '<table class="bt"><thead><tr><th>区间</th><th>交易数</th><th>胜率</th><th>均收益</th><th>最好 / 最差</th><th>组合期末净值</th><th>年化</th><th>上证同期</th><th>年化超额</th></tr></thead><tbody><tr>' +
+    '<td>' + rangeTxt + '</td>' +
+    '<td>' + B.trades + '</td>' +
+    '<td>' + s.wr + '%</td>' +
+    '<td>' + (s.avg >= 0 ? '+' : '') + s.avg + '%</td>' +
+    '<td>' + (s.best >= 0 ? '+' : '') + s.best + '% / ' + (s.worst >= 0 ? '+' : '') + s.worst + '%</td>' +
+    '<td><b>' + s.finalEquity + '</b></td>' +
+    '<td><b>' + (s.cagr >= 0 ? '+' : '') + s.cagr + '%</b></td>' +
+    '<td>' + (s.idxRet >= 0 ? '+' : '') + s.idxRet + '%</td>' +
+    '<td>' + (s.excess >= 0 ? '+' : '') + s.excess + '%</td>' +
+    '</tr></tbody></table>';
+
+  const rows = Object.keys(B.yearly).sort().map(y => {
+    const v = B.yearly[y];
+    return '<tr><td>' + y + '</td><td>' + v.samples + '</td><td>' + v.wr + '%</td><td>' + (v.avg >= 0 ? '+' : '') + v.avg + '%</td></tr>';
+  }).join('');
+  const year = '<h4>逐年表现（按建仓年份）</h4><table class="bt"><thead><tr><th>年份</th><th>交易数</th><th>胜率</th><th>每笔均收益</th></tr></thead><tbody>' + rows + '</tbody></table>';
+
+  const note = '<p><b>回测说明</b>：前 TOPN=' + B.topN + ' 名，持有 ' + B.hold + ' 个交易日，每 ' + B.step + ' 天调仓一次；双边成本 ' + B.cost + '%。组合层用 3 条错开 lane 模拟连续持仓（总持仓 = 3×TOPN）。<b>估值与行业排名全部中性化</b>——scoreLong 里 pe=20、pb=3、mcap=500、secRank=0.5，防未来函数。结果与实盘会有偏差（实盘用的是实时估值和行业排名）。</p>';
+
+  return '<section style="margin-top:8px"><h3>长期持有策略回测 <em>LONG HOLD · 60 DAYS</em> <em style="color:var(--muted);font-size:11px">' + (state.longBtTs ? new Date(state.longBtTs).toLocaleString('zh-CN', { hour12: false }) : '') + '</em></h3>' +
+    sum + year + note + cfg + '</section>';
 }
 
 function wrFor(setup, holdDays) {
@@ -2964,9 +3158,31 @@ function renderList() {
     return;
   }
   const div = diversify(arr);
-  /* 长线仅展示高分精选（>=70 分经回测验证为正收益区间）*/
-  let filtered = mode === 'long' ? div.filter(x => x.long.score >= 70) : div.filter(x => x.short.score >= 50);
-  if (!filtered.length) filtered = div;
+  /* 长线仅展示高分精选（>=70 分经回测验证为正收益区间）；短线过白名单 + 冷却期 */
+  const today = shToday();
+  let filtered;
+  if (mode === 'long') {
+    filtered = div.filter(x => x.long.score >= 70);
+    if (!filtered.length) filtered = div;
+  } else {
+    /* 读取冷却期记录（本地持久化） */
+    let coolMap = {};
+    try { coolMap = JSON.parse(localStorage.getItem('qr_short_cooldown') || '{}'); } catch (e) {}
+    const cutoff = dayStr(new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 1, +today.slice(8, 10)) - SHORT_COOLDOWN_DAYS * 86400000));
+    filtered = div.filter(x => {
+      const sk = x.short && x.short.setup;
+      if (!sk) return false;
+      /* 白名单：非白名单形态不进核心精选 */
+      if (SHORT_WHITELIST[sk] === false) return false;
+      /* 冷却期：同票 N 天内只出现一次（避免同一下跌被反复计入） */
+      const last = coolMap[x.code];
+      if (last && last >= cutoff) return false;
+      coolMap[x.code] = today;
+      return x.short.score >= 50;
+    });
+    try { localStorage.setItem('qr_short_cooldown', JSON.stringify(coolMap)); } catch (e) {}
+    if (!filtered.length) filtered = div.filter(x => x.short.score >= 50);
+  }
 
   /* —— 筹码形态统计 + 筛选（策略页）—— */
   filtered.forEach(x => {
@@ -3011,8 +3227,8 @@ function renderList() {
   if (mode === 'short' && !state.search && state.ind === '全部') {
     const down = state.marketUp === false;
     html += '<div class="notice' + (down ? ' warn' : '') + '">' + (down
-      ? '<b>大盘下行</b>：短线只保留「逆势强势」结构（回测胜率 53%、5 日均 +1.29%），其余标的分数已下调，建议仓位减半、持有 3–5 日。'
-      : '<b>大盘多头</b>：优先「放量突破 / KDJ 拐点」，持有 3–5 个交易日；回测显示 5 日收益优于 10 日。') + '</div>';
+      ? '<b>大盘下行</b>：短线核心精选只保留「逆势强势 + 放量突破」（11 年实测 3 日均 +0.15%、胜率 45%），其余形态默认隐藏；同票 20 天内只出现一次。仓位建议轻，持有 5–10 日观察。'
+      : '<b>大盘多头</b>：核心精选默认只放正期望形态「逆势强势 + 放量突破」；KDJ 拐点/弱势反抽 11 年 3 日均为负，默认隐藏。持有 3–5 日或配合冷却期信号轮换。') + '</div>';
   }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (rest.length) {
@@ -3466,6 +3682,7 @@ function renderStrategy() {
       '<p>扣分项：RSI6 超买、KDJ-J 高位钝化、偏离 20 日线过远、5 日涨幅过大、20 日跌幅过大（接飞刀）、周线动能向下（三重滤网未过）、量价顶背离。</p>' +
       '<p>仅展示 <b>≥50 分</b> 的标的，并与「形态胜率」一起呈现。适合：3–5 个交易日持有，严格执行止损与时间止损。</p></section>' +
     buildBacktestHTML() +
+    buildLongBacktestHTML() +
     '<section><h3>交易策略 <em>HOW TO TRADE</em></h3>' +
       '<div class="kv"><span>资金分层</span><b>核心 60% / 卫星 25% / 现金 15%</b></div>' +
       '<p><b>① 核心仓（长线，60%）</b>：只买长线评分 <b>≥70</b> 且道氏结构向上的标的，按 ATR 单位（1% 风险）建仓，单票不超过 20%。持有 6–18 个月，只按「周线 MACD 死叉」或「跌破年线」离场，不做日内波动博弈。</p>' +
@@ -3517,6 +3734,30 @@ function renderStrategy() {
     state.backtest = null;
     state.backtestTs = 0;
     localStorage.removeItem('qr_backtest');
+    renderStrategy();
+  };
+
+  /* 长期回测按钮事件 */
+  const rlb = $('#runLongBtBtn');
+  if (rlb) rlb.onclick = async () => {
+    rlb.disabled = true;
+    rlb.textContent = '长期回测中…（约 1–3 分钟）';
+    setTimeout(() => {
+      const r = runLongBacktest();
+      rlb.disabled = false;
+      if (r && r.ok) {
+        rlb.textContent = '已完成 · 年化 ' + (r.summary.cagr >= 0 ? '+' : '') + r.summary.cagr + '% · ' + r.trades + ' 笔';
+      } else {
+        rlb.textContent = r && r.reason ? r.reason : '失败';
+      }
+      setTimeout(renderStrategy, 300);
+    }, 30);
+  };
+  const clb = $('#clearLongBtBtn');
+  if (clb) clb.onclick = () => {
+    state.longBacktest = null;
+    state.longBtTs = 0;
+    localStorage.removeItem('qr_long_backtest');
     renderStrategy();
   };
 }
@@ -4613,6 +4854,7 @@ async function init() {
   loadWatch();
   loadAuction();
   loadBacktest();
+  loadLongBacktest();
   bindEvents();
   const pack = await readCache();
   if (pack) {
