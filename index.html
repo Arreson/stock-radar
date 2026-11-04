@@ -199,6 +199,12 @@ canvas.spark{display:block;width:100%;height:38px}
 .watch-advice .wa-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px}
 .watch-advice .wa-top .wa-score{font-size:10px;color:var(--dim)}
 .watch-advice .wa-sub{color:var(--muted);font-size:10px;margin-bottom:2px}
+.watch-advice .wa-sub .anchor-edit{cursor:pointer;border-bottom:1px dashed rgba(255,255,255,.28);padding-bottom:1px}
+.watch-advice .wa-sub .anchor-edit:hover{color:var(--txt)}
+.anchor-row{display:flex;gap:6px;margin:5px 0 2px}
+.anchor-row input{flex:1;min-width:0;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;color:var(--txt);font-size:12px;padding:5px 8px;outline:none}
+.anchor-row input:focus{border-color:#58a6ff}
+.anchor-row .btn{padding:4px 10px;font-size:11px}
 .watch-advice .wa-suggestion{color:var(--txt);font-size:11px;line-height:1.55}
 
 /* 紧凑排名行 */
@@ -3910,11 +3916,18 @@ function renderWatch() {
     '<div id="watchMatchBox" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:50;background:var(--bg2,rgba(30,30,40,.98));border:1px solid var(--line);border-radius:10px;margin-top:4px;max-height:260px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.3)"></div>' +
   '</div>';
 
+  let healed = false;   /* 是否自动补过锚定价，需回写 localStorage */
   const arr = Array.from(state.watch)
     .map(code => ({ code, x: state.data[code] }))
     .filter(o => o.x && o.x.long && o.x.short)
     .map(o => {
-      const meta = state.watchMeta[o.code];
+      /* 兜底补锚定：旧版自选升级后 anchorPrice 恒为 null，且已在榜单的股票不会再走 ensureWatchStock，
+         这里用最近收盘/现价自动补一次；用户手动清除后（manual=true）不再自动补 */
+      let meta = state.watchMeta[o.code];
+      if (!meta || (!(isNum(meta.anchorPrice) && meta.anchorPrice > 0) && !meta.manual)) {
+        meta = recordWatchMeta(o.code, o.x);
+        healed = true;
+      }
       const adv = watchAdvice(o.x, meta);
       /* 次日方向概率：复用短线引擎（形态×市场基准 + bearGold/量能/KDJ 调整） */
       let nd = null;
@@ -4066,7 +4079,8 @@ function renderWatch() {
     /* —— 建议行（卡片底部）—— */
     let adviceRow = '';
     if (adv) {
-      const anchorTxt = adv.anchor ? '锚定 ' + fmt(adv.anchor) + (adv.anchorDate ? '（' + adv.anchorDate + '）' : '') : '未锚定';
+      const anchorTxt = '<span class="anchor-edit" data-code="' + code + '" title="点击输入/修改锚定价">' +
+        (adv.anchor ? '锚定 ' + fmt(adv.anchor) + (adv.anchorDate ? '（' + adv.anchorDate + '）' : '') : '未锚定') + ' ✎</span>';
       const pctTxt = adv.pct != null ? '自选 ' + (adv.pct >= 0 ? '+' : '') + fmt(adv.pct, 2) + '%' : '';
       const shapeTxt = cyqShapeName ? '筹码·' + cyqShapeName : '';
       const sigTxt = [...adv.flags, ...adv.risks].slice(0, 3).join(' · ');
@@ -4093,9 +4107,64 @@ function renderWatch() {
 
   html += '</div><div class="disc">自选股不会自动买卖，请定期按「刷新」更新行情与评分。建议仅供参考。</div>';
   $('#list').innerHTML = html;
+  if (healed) saveWatch();
   bindAddWatch();
+  bindAnchorEdit();
   drawSparks();
   bindWatchFilter();
+}
+
+/* 锚定价手动编辑：点「锚定 X ✎」展开输入行 */
+function bindAnchorEdit() {
+  document.querySelectorAll('.anchor-edit').forEach(el => {
+    el.onclick = (ev) => { ev.stopPropagation(); openAnchorEditor(el); };
+  });
+}
+
+function openAnchorEditor(el) {
+  const code = el.dataset.code;
+  const old = el.parentNode.querySelector('.anchor-row');
+  if (old) { old.remove(); return; }      /* 再点一次收起 */
+  const meta = state.watchMeta[code] || {};
+  const x = state.data[code];
+  const row = document.createElement('div');
+  row.className = 'anchor-row';
+  row.innerHTML = '<input type="number" step="0.01" inputmode="decimal" placeholder="输入锚定价，如 12.34" value="' + (isNum(meta.anchorPrice) ? meta.anchorPrice : '') + '">' +
+    '<button class="btn" data-a="save">保存</button>' +
+    '<button class="btn" data-a="now">现价</button>' +
+    '<button class="btn" data-a="clear">清除</button>';
+  el.parentNode.appendChild(row);
+  const inp = row.querySelector('input');
+  setTimeout(() => { try { inp.focus(); inp.select(); } catch (e) {} }, 40);
+
+  const writeAnchor = (price, manual) => {
+    const m = state.watchMeta[code] || { addedAt: Date.now() };
+    m.anchorPrice = price;
+    m.anchorDate = price ? ((x && x.bars && x.bars.length) ? x.bars[x.bars.length - 1].d : new Date().toISOString().slice(0, 10)) : '';
+    m.manual = manual;
+    state.watchMeta[code] = m;
+    saveWatch();
+    toast(price ? '锚定价已设为 ' + fmt(price) + '（' + m.anchorDate + '）' : '已清除锚定价', 1400);
+    renderWatch();
+  };
+
+  row.querySelector('[data-a="save"]').onclick = (ev) => {
+    ev.stopPropagation();
+    const v = parseFloat(inp.value);
+    if (!(v > 0)) { toast('请输入大于 0 的价格', 1300); return; }
+    writeAnchor(+v.toFixed(2), true);
+  };
+  row.querySelector('[data-a="now"]').onclick = (ev) => {
+    ev.stopPropagation();
+    const p = isNum(x && x.price) && x.price > 0 ? x.price : (x && x.bars && x.bars.length ? x.bars[x.bars.length - 1].c : null);
+    if (!(p > 0)) { toast('暂无现价，请手动输入', 1300); return; }
+    writeAnchor(+p.toFixed(2), true);
+  };
+  row.querySelector('[data-a="clear"]').onclick = (ev) => {
+    ev.stopPropagation();
+    writeAnchor(null, true);   /* manual=true → 之后不再自动补 */
+  };
+  inp.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); row.querySelector('[data-a="save"]').click(); } };
 }
 
 function bindWatchFilter() {
