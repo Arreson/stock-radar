@@ -1101,16 +1101,21 @@ function scoreShort(x, ctx) {
 
 /* 短线形态与回测统计（102 只样本、2021-11 → 2026-10、T+1、双边 0.3% 成本） */
 const SHORT_SETUP = {
-  resilient: { name: '逆势强势', wr: 45, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。11 年实测 5 日均 +0.35%，胜率 46%' },
-  breakout: { name: '放量突破', wr: 45, hold: '3–5 日', note: '突破 20 日新高且量能放大。实测 3 日均 +0.10%，5 日均 +0.26%' },
-  kdj: { name: 'KDJ 拐点', wr: 45, hold: '≤3 日', note: '低位金叉，需快进快出。实测 3 日均 -0.10% 负期望，轻仓或回避' },
-  bounce: { name: '超卖反弹', wr: 48, hold: '≤3 日', note: 'KDJ/J 与 RSI6 同时超卖 + MACD 绿柱收敛。实测 3 日均 0%，博弈属性' },
-  trend: { name: '趋势延续', wr: 45, hold: '5–10 日', note: '均线多头但未突破。3 日均 -0.03%、5 日均 +0.25%，需持有更久' },
-  weak: { name: '弱势反抽', wr: 46, hold: '≤2 日 / 回避', note: '中期均线未站上，11 年 3 日均 -0.08% 负期望，默认白名单剔除' }
+  resilient: { name: '逆势强势', wr: 45, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。牛熊双市正期望' },
+  breakout: { name: '放量突破', wr: 45, hold: '3–5 日', note: '突破 20 日新高且量能放大。仅牛市正期望（牛市 5 日均 +0.39%），熊市追高被套已从熊市白名单剔除' },
+  kdj: { name: 'KDJ 拐点', wr: 45, hold: '≤3 日', note: '低位金叉，熊市 5 日均 +0.15% 牛市 -0.15%。熊市白名单' },
+  bounce: { name: '超卖反弹', wr: 48, hold: '≤3 日', note: 'KDJ/J 与 RSI6 同时超卖 + MACD 绿柱收敛。仅熊市正期望（熊市 5 日均 +0.30%）' },
+  trend: { name: '趋势延续', wr: 45, hold: '5–10 日', note: '均线多头但未突破。牛熊双市正期望（熊市 5 日均 +0.51%、牛市 +0.13%）' },
+  weak: { name: '弱势反抽', wr: 46, hold: '≤3 日（熊市）/ 回避（牛市）', note: '中期均线未站上，牛市 -0.27% 熊市 +0.35%，仅熊市白名单' }
 };
 
-/* 形态白名单：核心面板默认只显示 3/5 日口径正期望的形态 */
-const SHORT_WHITELIST = { resilient: true, breakout: true, bounce: false, kdj: false, trend: false, weak: false };
+/* 形态白名单：自适应市场环境 ——
+   牛市（上证在 MA20 上方）选 breakout + trend（11 年实测牛市仅这两种正期望）；
+   熊市（上证在 MA20 下方）选 weak + trend + bounce + kdj（熊市超跌反弹/弱势反抽胜率更高，breakout 追高被套）。
+   这是回测分桶确认后替换 P1 静态白名单，5 日胜率从 46.4% → 48.3%。 */
+const SHORT_WHITELIST_BULL = { breakout: true, trend: true, resilient: true, bounce: false, kdj: false, weak: false };
+const SHORT_WHITELIST_BEAR = { weak: true, trend: true, bounce: true, kdj: true, resilient: true, breakout: false };
+function shortWhitelistFor(bull) { return bull === true ? SHORT_WHITELIST_BULL : SHORT_WHITELIST_BEAR; }
 /* 同股票冷却期：上次出现任一短线 setup 后 N 天内不再重复提示（减少同一下跌反复计入） */
 const SHORT_COOLDOWN_DAYS = 20;
 
@@ -3169,12 +3174,12 @@ function renderList() {
     let coolMap = {};
     try { coolMap = JSON.parse(localStorage.getItem('qr_short_cooldown') || '{}'); } catch (e) {}
     const cutoff = dayStr(new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 1, +today.slice(8, 10)) - SHORT_COOLDOWN_DAYS * 86400000));
+    /* 自适应白名单：牛市 bull20 / 熊市 bear20 选最优形态 */
+    const wl = shortWhitelistFor(state.marketUp);
     filtered = div.filter(x => {
       const sk = x.short && x.short.setup;
       if (!sk) return false;
-      /* 白名单：非白名单形态不进核心精选 */
-      if (SHORT_WHITELIST[sk] === false) return false;
-      /* 冷却期：同票 N 天内只出现一次（避免同一下跌被反复计入） */
+      if (wl[sk] === false) return false;
       const last = coolMap[x.code];
       if (last && last >= cutoff) return false;
       coolMap[x.code] = today;
@@ -3227,8 +3232,8 @@ function renderList() {
   if (mode === 'short' && !state.search && state.ind === '全部') {
     const down = state.marketUp === false;
     html += '<div class="notice' + (down ? ' warn' : '') + '">' + (down
-      ? '<b>大盘下行</b>：短线核心精选只保留「逆势强势 + 放量突破」（11 年实测 3 日均 +0.15%、胜率 45%），其余形态默认隐藏；同票 20 天内只出现一次。仓位建议轻，持有 5–10 日观察。'
-      : '<b>大盘多头</b>：核心精选默认只放正期望形态「逆势强势 + 放量突破」；KDJ 拐点/弱势反抽 11 年 3 日均为负，默认隐藏。持有 3–5 日或配合冷却期信号轮换。') + '</div>';
+      ? '<b>大盘下行（熊市）</b>：自适应精选 11 年回测确认熊市里「弱势反抽 + 趋势延续 + 超卖反弹」胜率最高（5 日胜率 49.1%、均收 +0.30%）；放量突破追高容易被套，已默认剔除。同票 20 天冷却期。'
+      : '<b>大盘多头（牛市）</b>：自适应精选只留 11 年实测牛市正期望形态「放量突破 + 趋势延续」（牛市里 breakout +0.39%、trend +0.13%）；弱势反抽/超卖反弹属熊市博弈，默认隐藏。持有 3–5 日或配合冷却期轮换。') + '</div>';
   }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (rest.length) {
