@@ -1282,9 +1282,10 @@ const SHORT_SETUP = {
 };
 
 /* 形态白名单：自适应市场环境 ——
-   牛市（上证在 MA20 上方）选 breakout + trend + limitup（A 股连板牛市效应强）；
-   熊市（上证在 MA20 下方）选 weak + trend + bounce + kdj + gap（超跌反弹/弱势反抽/缺口接力胜率更高）。 */
-const SHORT_WHITELIST_BULL = { breakout: true, trend: true, resilient: true, limitup: true, gap: true, bounce: false, kdj: false, weak: false };
+   牛市（上证在 MA20 上方）选 breakout + trend + limitup + resilient（A 股连板牛市效应强）；
+   熊市（上证在 MA20 下方）选 weak + trend + bounce + kdj + gap（超跌反弹/弱势反抽/缺口接力胜率更高）。
+   注：gap 牛市实测 -0.80% 负期望（134 样本，牛市追缺口被套），已从牛市白名单剔除。 */
+const SHORT_WHITELIST_BULL = { breakout: true, trend: true, resilient: true, limitup: true, gap: false, bounce: false, kdj: false, weak: false };
 const SHORT_WHITELIST_BEAR = { weak: true, trend: true, bounce: true, kdj: true, resilient: true, limitup: true, gap: true, breakout: false };
 function shortWhitelistFor(bull) { return bull === true ? SHORT_WHITELIST_BULL : SHORT_WHITELIST_BEAR; }
 /* 同股票冷却期：上次出现任一短线 setup 后 N 天内不再重复提示（减少同一下跌反复计入） */
@@ -2421,7 +2422,8 @@ function analyzeMinute(minBars, dailyI) {
     avgUpper, avgLower,
     priceVolCorr,
     dayRet: dayRet * 100, dayRange: dayRange * 100,
-    totalBars: N
+    totalBars: N,
+    date: (B[N - 1].t || '').slice(0, 10)  /* 分钟数据所属交易日（VWAP 按此日期计算与展示） */
   };
 }
 
@@ -2466,7 +2468,8 @@ function scoreMinute(minInd, dailyI) {
     morningPct: minInd.morningRet.toFixed(1),
     tailPct: minInd.tailRet.toFixed(1),
     maxUpRun: minInd.maxUpRun,
-    dayPct: minInd.dayRet.toFixed(2)
+    dayPct: minInd.dayRet.toFixed(2),
+    date: minInd.date || ''
   };
 }
 
@@ -3686,14 +3689,18 @@ function cardHTML(x, mode, rank) {
   /* 换手率粗估（日线替代因子） */
   const estTR = (x.amount && x.mcap && x.mcap > 0) ? (x.amount / (x.mcap * 1e8) / 0.5 * 100) : null;
   const trMark = (estTR != null) ? ' · 换手≈' + estTR.toFixed(1) + '%' : '';
-  /* 分钟级信号（VWAP 偏离、早盘强弱、尾盘抢筹） */
+  /* 分钟级信号（VWAP 偏离、早盘强弱、尾盘抢筹）—— 均价按分钟数据所属交易日展示，过期置灰 */
   const minute = x.minute;
   let minuteMark = '';
   if (minute && minute.score) {
     const ms = minute.score;
-    if (ms.score >= 5) minuteMark = '<em style="color:var(--green);font-weight:600">VWAP+' + ms.vwapDivPct + '%' + (ms.maxUpRun >= 3 ? ' · ↑' + ms.maxUpRun : '') + '</em>';
-    else if (ms.score >= 1) minuteMark = '<em style="color:var(--green)">VWAP+' + ms.vwapDivPct + '%</em>';
-    else if (ms.score <= -3) minuteMark = '<em style="color:var(--red)">VWAP' + ms.vwapDivPct + '%</em>';
+    const stale = ms.date && ms.date !== shToday();
+    const dimDate = ms.date ? ' <span class="dim" style="font-weight:400">' + ms.date.slice(5) + (stale ? ' 旧' : '') + '</span>' : '';
+    if (stale) minuteMark = '<em class="dim">VWAP' + (ms.vwapDivPct >= 0 ? '+' : '') + ms.vwapDivPct + '%' + dimDate + '</em>';
+    else if (ms.score >= 5) minuteMark = '<em style="color:var(--green);font-weight:600">VWAP+' + ms.vwapDivPct + '%' + (ms.maxUpRun >= 3 ? ' · ↑' + ms.maxUpRun : '') + dimDate + '</em>';
+    else if (ms.score >= 1) minuteMark = '<em style="color:var(--green)">VWAP+' + ms.vwapDivPct + '%' + dimDate + '</em>';
+    else if (ms.score <= -3) minuteMark = '<em style="color:var(--red)">VWAP' + ms.vwapDivPct + '%' + dimDate + '</em>';
+    else if (ms.date) minuteMark = '<em class="dim">VWAP' + (ms.vwapDivPct >= 0 ? '+' : '') + ms.vwapDivPct + '%' + dimDate + '</em>';
   }
   const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark;
   const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.setupName || '') + ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—') + (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '');
