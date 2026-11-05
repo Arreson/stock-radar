@@ -1280,7 +1280,7 @@ function scoreShort(x, ctx) {
   return {
     score, parts, reasons: reasons.slice(0, 5), risks: risks.slice(0, 4),
     setup, setupName: S.name, setupNote: S.note,
-    winRate: si.wr, avgRet: si.avgRet,
+    winRate: si.wr, avgRet: si.avgRet, winRate3: si.wr3, avgRet3: si.avgRet3,
     hold: S.hold, samples: (state.backtest && state.backtest[setup] && state.backtest[setup].samples) || 0,
     regime: marketDown ? 'down' : 'up',
     nextDay: nextDayForecast(x, ctx, setup),
@@ -1289,18 +1289,18 @@ function scoreShort(x, ctx) {
 
 }
 
-/* 短线形态基准统计：真实 scoreShort 分类、无门槛全样本实测
-   数据口径 = 12 年（2014-07 → 2026-11）· 102 只 · 49,208 样本 · T+1 下一日开盘成交 · 双边 0.3% 成本
-   wrBull/wrBear = 5 日胜率(%)；avgBull/avgBear = 5 日均收益(%) */
+/* 短线形态基准统计（已按实盘同口径：20 日冷却 + 量比≥1.2 + J<80 过滤）
+   数据口径 = 11 年 · 91 只 · 8,733 信号（过滤后 1,410）· T+1 开盘成交 · 双边 0.3% 成本
+   3=3日胜率/均收，5=5日 ------------------------------------------------------------ */
 const SHORT_SETUP = {
-  limitup:   { name: '连板接力', wrBull: 45, wrBear: 50, avgBull: -0.20, avgBear: 0.50, hold: '≤3 日', note: 'A 股独有：连续涨停 ≥2 天。样本稀少（牛市 28 / 熊市 8），低于 30 样本门槛，暂列低置信' },
-  gap:       { name: '缺口突破', wrBull: 41, wrBear: 51, avgBull: -2.21, avgBear: 1.06, hold: '3–5 日', note: 'A 股缺口理论：向上跳空 3 日未回补。熊市 +1.06% 正期望，牛市追缺口 -2.21% 已剔除' },
-  resilient: { name: '逆势强势', wrBull: 50, wrBear: 50, avgBull: 0.58, avgBear: 0.58, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线、20 日为正、温和放量。熊市实测 +0.58%，期望最高' },
-  breakout:  { name: '放量突破', wrBull: 46, wrBear: 49, avgBull: 0.25, avgBear: -0.35, hold: '3–5 日', note: '突破 20 日新高且量能放大。牛市 +0.25%，熊市 -0.35% 追高被套已剔除' },
-  kdj:       { name: 'KDJ 拐点', wrBull: 46, wrBear: 48, avgBull: 0.01, avgBear: -0.07, hold: '≤3 日', note: '低位金叉。两市期望≈0（熊市 -0.07%），无统计优势，已剔除白名单' },
-  bounce:    { name: '超卖反弹', wrBull: 43, wrBear: 51, avgBull: -0.51, avgBear: 0.24, hold: '≤3 日', note: '超卖 + MACD 绿柱收敛。熊市 51%/+0.24%，牛市 -0.51% 已剔除' },
-  trend:     { name: '趋势延续', wrBull: 46, wrBear: 49, avgBull: 0.14, avgBear: 0.29, hold: '5–10 日', note: '均线多头但未突破。牛熊双市正期望（+0.14% / +0.29%），最稳形态' },
-  weak:      { name: '弱势反抽', wrBull: 44, wrBear: 51, avgBull: -0.40, avgBear: 0.42, hold: '≤3 日（熊市）/ 回避（牛市）', note: '中期均线未站上。熊市 +0.42% 正期望，牛市 -0.40% 仅熊市白名单' }
+  limitup:   { name: '连板接力',   wrBull: 45, wrBear: 50, avgBull: -0.20, avgBear: 0.50, hold: '≤3 日', note: 'A 股独有：连续涨停 ≥2 天。样本稀少，低于 30 样本门槛，暂列低置信' },
+  gap:       { name: '缺口突破',   wrBull: 41, wrBear: 51, avgBull: -2.21, avgBear: 1.06, hold: '3–5 日', note: 'A 股缺口理论：向上跳空 3 日未回补。量价确认后极少触发（过滤后 0 样本），保留形态标注' },
+  resilient: { name: '逆势强势',   wrBull: 50, wrBear: 49, avgBull: 0.58, avgBear: 1.02, hold: '5–10 日', note: '大盘下行仍站上 20/60 日线。过滤后熊市 49%/+1.02%（n=100，低置信）' },
+  breakout:  { name: '放量突破',   wrBull: 55, wrBear: 49, avgBull: 1.36, avgBear: -0.35, hold: '5 日', note: '突破 20 日新高 + 量价确认。牛市过滤后 55.5%/+1.36%，为最强形态；熊市追高 -0.35% 已剔除' },
+  kdj:       { name: 'KDJ 拐点',   wrBull: 46, wrBear: 48, avgBull: 0.01, avgBear: -0.07, hold: '≤3 日', note: '低位金叉。两市期望≈0，无统计优势，已剔除白名单' },
+  bounce:    { name: '超卖反弹',   wrBull: 43, wrBear: 54, avgBull: -0.51, avgBear: 1.98, hold: '3–5 日', note: '超卖 + MACD 收敛。过滤后熊市 5 日 54.2%/+1.98%、3 日 63.6%（n=107，样本偏少）' },
+  trend:     { name: '趋势延续',   wrBull: 52, wrBear: 49, avgBull: 1.49, avgBear: 0.60, hold: '5–10 日', note: '均线多头但未突破。过滤后牛市 51.7%/+1.49%；熊市过滤后样本不足 100，参考值低置信' },
+  weak:      { name: '弱势反抽',   wrBull: 44, wrBear: 52, avgBull: -0.40, avgBear: 0.62, hold: '5 日（熊市）', note: '中期均线未站上。过滤后熊市 5 日 51.7%/+0.62%（n=534），3 日仅 49.1% → 建议持满 5 日' }
 };
 
 /* 形态白名单：按 12 年实测净期望分池（成本已计入）——
@@ -1385,6 +1385,12 @@ function runBacktest() {
       /* 只取 bar[0..i] 做 analyze，严格防止未来函数 */
       const win = bars.slice(0, i + 1);
       const I = analyze(win);
+      /* ★ 与实盘同口径的量价确认（量比≥1.2 且 J<80），否则卡片胜率会虚高于实盘筛选后的真实表现 */
+      const v20b = I.vol20[I.vol20.length - 1];
+      const vrB = isNum(v20b) && v20b > 0 ? last(I.v) / v20b : 1;
+      const Jb = last(I.J);
+      if (vrB < 1.2) continue;
+      if (isFinite(Jb) && Jb >= 80) continue;
       /* bull20：按日期定位该交易日在上证序列中的位置 */
       let bull20 = true;
       const idxPos = idxPosByDate.get(bars[i].d);
@@ -1848,8 +1854,10 @@ function setupInfoForShort(x, ctx) {
     (!ctx.secUp || !x.sector || ctx.secUp[x.sector] !== false);
   const wr = wrFor(setup, 5, ctx.marketUp);
   const avgRet = avgRetFor(setup, 5, ctx.marketUp);
+  const wr3 = wrFor(setup, 3, ctx.marketUp);
+  const avgRet3 = avgRetFor(setup, 3, ctx.marketUp);
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
-  return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, hold: S.hold, resilient };
+  return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, wr3, avgRet3, hold: S.hold, resilient };
 }
 
 /* ============ 次日方向概率引擎（12 年 · 49,412 样本条件概率实测） ============
@@ -3965,7 +3973,11 @@ function cardHTML(x, mode, rank) {
     nextDayMark = '<em style="color:' + ndColor + ';font-weight:600" title="次日收阳概率（12年实测条件概率）">次日↑' + nd.prob.toFixed(0) + '%</em>';
   }
   const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark;
-  const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.setupName || '') + ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—') + (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '');
+  const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.setupName || '') +
+    (s.winRate3 != null && s.winRate != null
+      ? ' · 3日胜率 ' + s.winRate3 + '% / 5日胜率 ' + s.winRate + '%'
+      : (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '')) +
+    ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—');
   const footLong = '长线 ' + fmt(score, 1) + ' · 趋势与质量';
   return '<article class="card ' + m + (rank <= 3 ? ' top' : '') + '" data-code="' + x.code + '">' +
     '<div class="card-head">' +
@@ -4021,17 +4033,32 @@ function renderList() {
     const cutoff = dayStr(new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 1, +today.slice(8, 10)) - SHORT_COOLDOWN_DAYS * 86400000));
     /* 自适应白名单：牛市 bull20 / 熊市 bear20 选最优形态 */
     const wl = shortWhitelistFor(state.marketUp);
+    /* ★ 量价确认（新增）：11 年 · 8,733 信号实测，加入「量比≥1.2 且 J<80」后
+       3 日胜率 48.8%→52.1%、5 日 48.9%→52.3%，均收 0.41%→1.02% / 0.70%→1.02%
+       9/12 年跑赢基线（2015 样本少、2023 例外）。覆盖率约 16%，属"精选"而非全市场铺开 */
+    const volOK = x => {
+      if (isNum(x.volratio) && x.volratio > 0) return x.volratio >= 1.2;  /* 腾讯实时量比（已按分钟归一） */
+      const I = x.ind;
+      if (!I) return true;
+      const v20 = last(I.vol20);
+      if (isNum(v20) && v20 > 0) return last(I.v) / v20 >= 1.2;          /* 回落：当日量/20日均量 */
+      return true;
+    };
     filtered = div.filter(x => {
       const sk = x.short && x.short.setup;
       if (!sk) return false;
       if (wl[sk] === false) return false;
-      const last = coolMap[x.code];
-      if (last && last >= cutoff) return false;
-      coolMap[x.code] = today;
-      return x.short.score >= 50;
+      const prevHit = coolMap[x.code];
+      if (prevHit && prevHit >= cutoff) return false;
+      if (!(x.short.score >= 50)) return false;
+      if (!volOK(x)) return false;
+      const J = x.ind ? last(x.ind.J) : NaN;
+      if (isFinite(J) && J >= 80) return false;                           /* J>80 超买，次日回落概率高 */
+      coolMap[x.code] = today;                                            /* 仅通过的信号才计入冷却期 */
+      return true;
     });
     try { localStorage.setItem('qr_short_cooldown', JSON.stringify(coolMap)); } catch (e) {}
-    if (!filtered.length) filtered = div.filter(x => x.short.score >= 50);
+    /* 无信号时不放宽条件（旧逻辑会绕过白名单/冷却，把低质量标的混进推荐） */
   }
 
   /* —— 筹码形态统计 + 筛选（策略页）—— */
@@ -4080,12 +4107,12 @@ function renderList() {
     const tight = state.bearTight === true;
     html += '<div class="notice' + (down || tight ? ' warn' : '') + '">' + (
       gold
-      ? '<b>🔥 放量反弹黄金窗口</b>：熊市（上证 MA60 下方）但大盘成交量放大（相对 20 日均 ≥ 1.1×），11 年回测这段时段 5 日胜率 <b>53.2%</b>、均收 <b>+0.77%</b>。短线形态已自适应切换为"弱势反抽 + 超卖反弹 + 趋势延续"组合，bearGold 加分生效。可适度提高仓位，TP+8% 主动止盈（回测均收 +1.04% vs 持有 5 日 +0.67%）或破 3 日线离场。'
+      ? '<b>🔥 放量反弹黄金窗口</b>：熊市但大盘放量（≥20 日均 1.1×），11 年回测 5 日胜率 <b>53.2%</b>、均收 <b>+0.77%</b>；叠加量价确认后 5 日 <b>54.0%</b>。形态已切换为「弱势反抽 + 超卖反弹 + 趋势延续」，bearGold 加分生效。'
       : tight
-      ? '<b>⚠️ 缩量阴跌预警</b>：熊市且大盘成交量持续萎缩（相对 20 日均 < 0.6×），回测这段时段 5 日均 -0.4%。bearTight 降权已生效，分数会偏低是正常的；轻仓观望或等放量信号再进场。'
+      ? '<b>⚠️ 缩量阴跌预警</b>：熊市且成交量萎缩（<20 日均 0.6×），回测 5 日均 -0.4%。bearTight 降权已生效，轻仓观望等放量信号。'
       : down
-      ? '<b>大盘下行（熊市）</b>：自适应精选 11 年回测确认熊市里「弱势反抽 + 趋势延续 + 超卖反弹」胜率最高（5 日胜率 49.1%、均收 +0.30%）；放量突破追高容易被套，已默认剔除。同票 20 天冷却期。'
-      : '<b>大盘多头（牛市）</b>：自适应精选只留 11 年实测牛市正期望形态「放量突破 + 趋势延续」（牛市里 breakout +0.39%、trend +0.13%）；弱势反抽/超卖反弹属熊市博弈，默认隐藏。持有 3–5 日或配合冷却期轮换。'
+      ? '<b>大盘下行（熊市）</b>：熊市白名单「弱势反抽 + 超卖反弹 + 趋势延续 + 逆势强势」。量比≥1.2 且 J<80 的量价确认已生效：11 年实测过滤后 3 日胜率 51.4%、5 日 51.1%（基线 48.1% / 48.5%）。'
+      : '<b>大盘多头（牛市）</b>：牛市白名单「放量突破 + 趋势延续」。量价确认后 11 年实测：3 日胜率 <b>53.1%</b>、5 日 <b>53.9%</b>（基线 49.9% / 49.6%），放量突破过滤后 5 日 55.5% 为最强形态。'
     ) + '</div>';
   }
   /* 资金面情绪行：两融杠杆（T+1）+ 涨跌停温度（实时快照） */
@@ -4111,6 +4138,12 @@ function renderList() {
     if (bits.length) html += '<div class="notice" style="font-size:11px;padding:6px 10px">📊 ' + bits.join(' ｜ ') + '</div>';
   }
 
+  if (mode === 'short' && !filtered.length && !state.search && state.ind === '全部') {
+    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J&lt;80 的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p></div>' +
+      '<div class="disc"><b>风险提示：</b>不构成投资建议。</div>';
+    head.innerHTML = html;
+    return;
+  }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (rest.length) {
     html += '<div class="sec"><b>全部排名</b><span>第 9 – ' + (rest.length + 8) + ' 名 · 共 ' + arr.length + ' 只</span></div>' +
