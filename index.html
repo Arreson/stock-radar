@@ -2878,32 +2878,106 @@ function loadAuction() {
   } catch (e) {}
 }
 
-/* 竞价 → 当日盘中触及涨停概率（73 只高流动性股 × 11 年日线实测，10% 主板口径）
-   基准 4.06%。单日信号：高开3-6%+量≥2=47%；高开≥6%+量≥2=83%
-   昨日信号（9:25 可知）：昨日触板+高开≥1%=48%（连板效应）；5日≥15%+高开≥6%=90%
-   注意：①触板≠封板（封板率约为触板的 60%）；②20cm 票（30/68 开头）打 6 折 */
+/* —— 涨停测算引擎：用本地缓存日线现场计算"开盘涨幅×量比→触板率"，替代硬编码表 ——
+   口径与离线回测一致：10% 主板口径、触板=盘中 high ≥ 昨收×1.099、样本不足 30 格回落默认值 */
+const LIMIT_STATS_KEY = 'qr_limitstats_v1';
+function loadLimitStats() {
+  try { const j = JSON.parse(localStorage.getItem(LIMIT_STATS_KEY) || 'null'); if (j && j.cells) state.limitStats = j; } catch (e) {}
+}
+function saveLimitStats() { try { localStorage.setItem(LIMIT_STATS_KEY, JSON.stringify(state.limitStats)); } catch (e) {} }
+
+function computeLimitUpStats() {
+  const t0 = Date.now();
+  /* 格：gap 4 桶 × vr 3 桶；hist 组合 5 项 */
+  const G = [[1, 3], [3, 6], [6, 9], [9, 99]];
+  const V = [[0, 1], [1, 2], [2, 99]];
+  const cells = G.map(() => V.map(() => ({ n: 0, hit: 0 })));
+  const hist = { ptGapUp: { n: 0, hit: 0 }, ptGapDn: { n: 0, hit:0 }, r15g6: { n: 0, hit: 0 }, r15g3: { n: 0, hit: 0 }, r15g1: { n: 0, hit: 0 } };
+  let total = 0, hits = 0;
+  for (const code of Object.keys(state.data)) {
+    const bars = state.data[code] && state.data[code].bars;
+    if (!bars || bars.length < 70) continue;
+    for (let i = 61; i < bars.length; i++) {
+      const prev = bars[i-1].c, o = bars[i].o, h = bars[i].h;
+      if (!prev || !o || !h || prev <= 0) continue;
+      total++;
+      const limit = prev * 1.099, touch = h >= limit;
+      if (touch) hits++;
+      const g = (o / prev - 1) * 100;
+      const prevTouch = i >= 2 && bars[i-1].h >= bars[i-2].c * 1.099;
+      if (prevTouch && g < 0) { hist.ptGapDn.n++; if (touch) hist.ptGapDn.hit++; }
+      if (g < 1) continue;
+      let vs = 0; for (let j = i - 20; j < i; j++) vs += bars[j].v || 0;
+      const vr = (vs / 20) > 0 ? (bars[i].v || 0) / (vs / 20) : 1;
+      const gi = G.findIndex(b => g >= b[0] && g < b[1]);
+      const vi = V.findIndex(b => vr >= b[0] && vr < b[1]);
+      if (gi >= 0 && vi >= 0) { cells[gi][vi].n++; if (touch) cells[gi][vi].hit++; }
+      const prevTouch2 = prevTouch;
+      const ret5 = i >= 6 ? (bars[i-1].c / bars[i-6].c - 1) * 100 : 0;
+      if (prevTouch2 && g >= 1) { hist.ptGapUp.n++; if (touch) hist.ptGapUp.hit++; }
+      if (!prevTouch && ret5 >= 15) {
+        if (g >= 6) { hist.r15g6.n++; if (touch) hist.r15g6.hit++; }
+        else if (g >= 3) { hist.r15g3.n++; if (touch) hist.r15g3.hit++; }
+        else { hist.r15g1.n++; if (touch) hist.r15g1.hit++; }
+      }
+    }
+  }
+  const rate = b => (b.n >= 30) ? +(b.hit / b.n * 100).toFixed(1) : null;   /* 样本不足返回 null → 回落默认 */
+  state.limitStats = {
+    date: state.lastDate || dayStr(new Date()),
+    stocks: Object.keys(state.data).length, total, hits,
+    base: total ? +(hits / total * 100).toFixed(2) : 0,
+    cells: cells.map(row => row.map(c => ({ n: c.n, p: rate(c) }))),
+    hist: Object.fromEntries(Object.entries(hist).map(([k, b]) => [k, { n: b.n, p: rate(b) }])),
+    ms: Date.now() - t0,
+  };
+  saveLimitStats();
+  return state.limitStats;
+}
+
+/* 竞价 → 当日盘中触及涨停概率（测算引擎驱动，qr_limitstats_v1；无测算时回落默认值）
+   离线基准：高开3-6%+量≥2≈47%；昨日触板+高开≥1%≈48%（连板效应）；20cm 票打 6 折 */
 function limitUpProb(code, pct, vr, hist) {
-  let p;
-  if (pct >= 9) p = 95;
-  else if (pct >= 6) p = vr >= 2 ? 83 : vr >= 1 ? 59 : 40;
-  else if (pct >= 3) p = vr >= 2 ? 47 : vr >= 1 ? 26 : 18;
-  else if (pct >= 1) p = vr >= 2 ? 32 : vr >= 1.5 ? 15 : 9;
-  else if (pct >= 0) p = 3;
-  else p = 2;
-  /* 昨日信号修正（有日线缓存时） */
+  const LS = state.limitStats;
+  let p = null;
+  /* 主表：gap × vr 实测格（样本不足格回落默认） */
+  if (LS && LS.cells) {
+    const G = [[1, 3], [3, 6], [6, 9], [9, 99]], V = [[0, 1], [1, 2], [2, 99]];
+    const gi = G.findIndex(b => pct >= b[0] && pct < b[1]);
+    const vi = V.findIndex(b => vr >= b[0] && vr < b[1]);
+    if (gi >= 0 && vi >= 0 && LS.cells[gi][vi].p != null) p = LS.cells[gi][vi].p;
+  }
+  if (p == null) {
+    if (pct >= 9) p = 95;
+    else if (pct >= 6) p = vr >= 2 ? 83 : vr >= 1 ? 59 : 40;
+    else if (pct >= 3) p = vr >= 2 ? 47 : vr >= 1 ? 26 : 18;
+    else if (pct >= 1) p = vr >= 2 ? 32 : vr >= 1.5 ? 15 : 9;
+    else if (pct >= 0) p = 3;
+    else p = 2;
+  }
+  /* 昨日信号修正（优先实测值，样本不足回落默认） */
   if (hist) {
+    const H = LS && LS.hist ? LS.hist : {};
     if (hist.prevTouch) {
-      if (pct >= 1) p = Math.max(p, hist.ret5 >= 15 ? 53 : 48);      /* 连板预期 */
-      else if (pct < 0) p = Math.min(p, 16);                          /* 昨日触板今低开=走弱 */
+      if (pct >= 1) {
+        const m = H.ptGapUp && H.ptGapUp.p != null ? H.ptGapUp.p : 48;
+        p = Math.max(p, hist.ret5 >= 15 ? Math.min(95, m + 5) : m);
+      } else if (pct < 0) {
+        const m = H.ptGapDn && H.ptGapDn.p != null ? H.ptGapDn.p : 16;
+        p = Math.min(p, m);
+      }
     } else if (hist.ret5 >= 15) {
-      if (pct >= 6) p = Math.max(p, 90);
-      else if (pct >= 3) p = Math.max(p, 44);
-      else if (pct >= 1) p = Math.max(p, 21);
+      const key = pct >= 6 ? 'r15g6' : pct >= 3 ? 'r15g3' : pct >= 1 ? 'r15g1' : null;
+      const dft = pct >= 6 ? 90 : pct >= 3 ? 44 : 21;
+      if (key) {
+        const m = H[key] && H[key].p != null ? H[key].p : dft;
+        p = Math.max(p, m);
+      }
     }
   }
   const pre = code.slice(2, 4);
   if (pre === '30' || pre === '68') p = Math.round(p * 0.6);   /* 20cm 涨停更难 */
-  return Math.min(95, Math.max(1, p));
+  return Math.min(95, Math.max(1, Math.round(p)));
 }
 
 /* 竞价强势评分：涨幅/量比/成交额/市值 四维 + 技术面加分 */
@@ -3226,6 +3300,15 @@ async function refreshFull(opts) {
     (async () => {
       const nb = await fetchNorthSentiment();
       if (nb && (Object.keys(nb.top10 || {}).length || nb.toYi != null)) { scoreAll(); render(); }
+    })();
+    /* ★ 涨停测算引擎：数据日期变化时重算（约 0.1~0.3s），竞价页概率自动采用实测值 */
+    (async () => {
+      try {
+        if (!state.limitStats || state.limitStats.date !== (state.lastDate || dayStr(new Date()))) {
+          computeLimitUpStats();
+          if (state.tab === 'auction') renderAuction();
+        }
+      } catch (e) {}
     })();
     /* ★ 分钟级数据异步补充：拉 Top 15 短线精选票的 5 分钟线，
        计算 VWAP/早盘/尾盘 等日内因子，不阻塞主流程 */
@@ -4459,14 +4542,48 @@ function renderAuction() {
   }).join('');
 
   const foot = '<div class="disc"><b>竞价交易风险：</b>9:15–9:20 可撤单，9:20 后不可撤单，9:25 为真实撮合价。建议只在 9:25 定格后按买入区间挂单；单只仓位 3–8%，严格止损。本工具不构成投资建议。</div>' +
+    limitStatsPanel() +
     '<button class="btn" id="aucBtn" style="margin:14px auto">' + (a.frozen ? '重新拉取实时快照' : '刷新竞价快照') + '</button>';
 
   head.innerHTML = headBar + '<div class="list">' + cards + '</div>' + foot;
   const b = $('#aucBtn');
   if (b) b.onclick = () => runAuctionScan();
+  const lb = $('#lsBtn');
+  if (lb) lb.onclick = () => { computeLimitUpStats(); renderAuction(); };
   $$('#list .card.auction').forEach(c => c.onclick = () => openDetail(c.dataset.code));
 }
 
+/* 测算引擎面板：展示实测触板率矩阵 + 昨日信号组合 */
+function limitStatsPanel() {
+  const LS = state.limitStats;
+  if (!LS || !LS.cells) {
+    return '<div class="notice" style="font-size:11px;padding:8px 10px">📐 测算引擎：暂无数据，点「重新测算」用本地日线现场计算触板率矩阵。<button class="btn" id="lsBtn" style="margin:8px auto 0">重新测算</button></div>';
+  }
+  const glabels = ['高开1-3%', '高开3-6%', '高开6-9%', '高开≥9%'];
+  const vlabels = ['量<1', '量1-2', '量≥2'];
+  let rows = '';
+  LS.cells.forEach((row, gi) => {
+    row.forEach((c, vi) => {
+      if (c.p == null) return;
+      rows += '<div class="rv-group" style="padding:6px 8px"><div class="rv-g-name" style="font-size:11px">' + glabels[gi] + ' · ' + vlabels[vi] + '</div>' +
+        '<div class="rv-g-stat"><span class="' + (c.p >= 30 ? 'up' : c.p >= 12 ? '' : 'down') + '" style="font-size:13px">' + c.p + '%</span><small>n=' + c.n + '</small></div></div>';
+    });
+  });
+  const hk = { ptGapUp: '昨日触板+高开≥1%', ptGapDn: '昨日触板+低开', r15g6: '5日≥15%+高开≥6%', r15g3: '5日≥15%+高开3-6%', r15g1: '5日≥15%+高开1-3%' };
+  let hrows = '';
+  Object.entries(LS.hist || {}).forEach(([k, b]) => {
+    if (!b || b.p == null) return;
+    hrows += '<div class="rv-group" style="padding:6px 8px"><div class="rv-g-name" style="font-size:11px">' + hk[k] + '</div>' +
+      '<div class="rv-g-stat"><span class="' + (b.p >= 30 ? 'up' : '') + '" style="font-size:13px">' + b.p + '%</span><small>n=' + b.n + '</small></div></div>';
+  });
+  return '<div class="notice" style="font-size:11px;padding:8px 10px">' +
+    '📐 <b>涨停测算引擎</b> · ' + LS.date + ' · ' + LS.stocks + ' 只 × ' + LS.total.toLocaleString() + ' 样本 · 基准触板率 <b>' + LS.base + '%</b>（触板=盘中摸到涨停价，非封板）' +
+    '<div class="rv-groups" style="margin-top:6px">' + rows + '</div>' +
+    (hrows ? '<div style="margin:6px 0 2px;color:var(--muted)">昨日信号组合（连板/强动量）</div><div class="rv-groups">' + hrows + '</div>' : '') +
+    '<button class="btn" id="lsBtn" style="margin:8px auto 0">重新测算</button></div>';
+}
+
+/* 盘后复盘 */
 function renderReview() {
   const rows = reviewCollect();
   if (!rows.length) {
@@ -5749,6 +5866,7 @@ async function init() {
   loadBacktest();
   loadLongBacktest();
   loadNorth();
+  loadLimitStats();
   bindEvents();
   const pack = await readCache();
   if (pack) {
