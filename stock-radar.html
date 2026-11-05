@@ -2878,6 +2878,22 @@ function loadAuction() {
   } catch (e) {}
 }
 
+/* 竞价 → 当日盘中触及涨停概率（73 只高流动性股 × 11 年日线实测，10% 主板口径）
+   基准 2.5%；高开3-6%+量≥2 ≈ 47%；高开≥6%+量≥2 ≈ 83%
+   注意：①竞价比≠全天量比（9:25 口径更纯）；②触板≠封板；③20cm 票（30/68 开头）概率打 6 折 */
+function limitUpProb(code, pct, vr) {
+  let p;
+  if (pct >= 9) p = 95;
+  else if (pct >= 6) p = vr >= 2 ? 83 : vr >= 1 ? 59 : 40;
+  else if (pct >= 3) p = vr >= 2 ? 47 : vr >= 1 ? 26 : 18;
+  else if (pct >= 1) p = vr >= 2 ? 32 : vr >= 1.5 ? 15 : 9;
+  else if (pct >= 0) p = 3;
+  else p = 2;
+  const pre = code.slice(2, 4);
+  if (pre === '30' || pre === '68') p = Math.round(p * 0.6);   /* 20cm 涨停更难 */
+  return Math.min(95, Math.max(1, p));
+}
+
 /* 竞价强势评分：涨幅/量比/成交额/市值 四维 + 技术面加分 */
 function scoreAuction(r) {
   const name = (r.f14 || '').replace(/\s+/g, '');
@@ -2946,6 +2962,7 @@ function scoreAuction(r) {
     code, name, ind: r.f100 || '其他',
     price, pct, amtYi, volRatio, circ,
     score: clamp(Math.round(v), 0, 100),
+    limitProb: limitUpProb(code, pct, isFinite(volRatio) ? volRatio : 1),
     reasons, risks,
     buyLow, buyHigh, stop, target, pos,
     setup: '竞价强势'
@@ -4381,9 +4398,13 @@ function renderAuction() {
   }
 
   const phaseCls = a.frozen ? '' : 'warn';
+  /* 涨停预测汇总：Top15 触板概率求和 = 期望触板只数（11 年日线实测近似口径） */
+  a.rows.forEach(r => { if (!isNum(r.limitProb)) r.limitProb = limitUpProb(r.code, r.pct, isNum(r.volRatio) ? r.volRatio : 1); });
+  const expLimit = a.rows.slice(0, 15).reduce((s, r) => s + r.limitProb, 0) / 100;
   const headBar = '<div class="sec"><b>竞价推荐 · ' + a.date + '</b>' +
     '<span>' + (a.ts ? new Date(a.ts).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '') + '</span></div>' +
-    '<div class="notice ' + phaseCls + '">' + a.msg + '</div>';
+    '<div class="notice ' + phaseCls + '">' + a.msg +
+    ' <b>今日 Top15 预计触板约 ' + expLimit.toFixed(1) + ' 只</b>（开盘涨幅×量比历史统计近似，触板≠封板，20cm 票已折算）</div>';
 
   const cards = a.rows.slice(0, 15).map((r, i) => {
     const pctCls = r.pct >= 0 ? 'up' : 'down';
@@ -4409,7 +4430,8 @@ function renderAuction() {
       '</div>' +
       '<div class="card-foot"><span>竞价额 ' + (r.amtYi ? r.amtYi.toFixed(2) + '亿' : '—') +
         ' · 量比 ' + (isNum(r.volRatio) ? r.volRatio.toFixed(1) : '—') +
-        ' · 评分 ' + r.score + '</span><span class="go">查看详情 ›</span></div>' +
+        ' · 评分 ' + r.score + '</span>' +
+        '<span class="num" style="font-weight:700;color:' + (r.limitProb >= 40 ? 'var(--up)' : r.limitProb >= 20 ? '#e3b341' : 'var(--dim)') + '" title="基于开盘涨幅×量比的 11 年历史统计近似（触板≠封板）">触板≈' + r.limitProb + '% ›</span></div>' +
     '</article>';
   }).join('');
 
