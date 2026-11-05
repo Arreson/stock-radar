@@ -2879,9 +2879,10 @@ function loadAuction() {
 }
 
 /* 竞价 → 当日盘中触及涨停概率（73 只高流动性股 × 11 年日线实测，10% 主板口径）
-   基准 2.5%；高开3-6%+量≥2 ≈ 47%；高开≥6%+量≥2 ≈ 83%
-   注意：①竞价比≠全天量比（9:25 口径更纯）；②触板≠封板；③20cm 票（30/68 开头）概率打 6 折 */
-function limitUpProb(code, pct, vr) {
+   基准 4.06%。单日信号：高开3-6%+量≥2=47%；高开≥6%+量≥2=83%
+   昨日信号（9:25 可知）：昨日触板+高开≥1%=48%（连板效应）；5日≥15%+高开≥6%=90%
+   注意：①触板≠封板（封板率约为触板的 60%）；②20cm 票（30/68 开头）打 6 折 */
+function limitUpProb(code, pct, vr, hist) {
   let p;
   if (pct >= 9) p = 95;
   else if (pct >= 6) p = vr >= 2 ? 83 : vr >= 1 ? 59 : 40;
@@ -2889,6 +2890,17 @@ function limitUpProb(code, pct, vr) {
   else if (pct >= 1) p = vr >= 2 ? 32 : vr >= 1.5 ? 15 : 9;
   else if (pct >= 0) p = 3;
   else p = 2;
+  /* 昨日信号修正（有日线缓存时） */
+  if (hist) {
+    if (hist.prevTouch) {
+      if (pct >= 1) p = Math.max(p, hist.ret5 >= 15 ? 53 : 48);      /* 连板预期 */
+      else if (pct < 0) p = Math.min(p, 16);                          /* 昨日触板今低开=走弱 */
+    } else if (hist.ret5 >= 15) {
+      if (pct >= 6) p = Math.max(p, 90);
+      else if (pct >= 3) p = Math.max(p, 44);
+      else if (pct >= 1) p = Math.max(p, 21);
+    }
+  }
   const pre = code.slice(2, 4);
   if (pre === '30' || pre === '68') p = Math.round(p * 0.6);   /* 20cm 涨停更难 */
   return Math.min(95, Math.max(1, p));
@@ -2941,6 +2953,7 @@ function scoreAuction(r) {
   /* 技术面加分：用昨日已缓存的日线数据 */
   const code = codeFromRow(r);
   const x = state.data[code];
+  let hist = null;
   if (x && x.ind) {
     const I = x.ind;
     try {
@@ -2949,6 +2962,16 @@ function scoreAuction(r) {
       if (I.k && I.d && I.k > I.d) { v += 3; reasons.push('KDJ 金叉'); }
       if (I.ret60 > 0.05) { v += 3; reasons.push('中期趋势向上'); }
     } catch (e) {}
+    /* 昨日信号：触板史 + 5日涨幅（连板效应实测 lift 5.6×） */
+    const bars = x.bars;
+    if (bars && bars.length >= 7) {
+      const n = bars.length;
+      const prevTouch = bars[n - 1].h >= bars[n - 2].c * 1.099;
+      const ret5 = (bars[n - 1].c / bars[n - 6].c - 1) * 100;
+      hist = { prevTouch, ret5 };
+      if (prevTouch) { v += 5; reasons.push('昨日触板·连板预期'); }
+      else if (ret5 >= 15) { v += 3; reasons.push('5日动量强'); }
+    }
   }
 
   /* 买入建议 */
@@ -2962,7 +2985,7 @@ function scoreAuction(r) {
     code, name, ind: r.f100 || '其他',
     price, pct, amtYi, volRatio, circ,
     score: clamp(Math.round(v), 0, 100),
-    limitProb: limitUpProb(code, pct, isFinite(volRatio) ? volRatio : 1),
+    limitProb: limitUpProb(code, pct, isFinite(volRatio) ? volRatio : 1, hist),
     reasons, risks,
     buyLow, buyHigh, stop, target, pos,
     setup: '竞价强势'
