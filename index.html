@@ -3149,10 +3149,10 @@ function normalizeMarket(rows, todayStr) {
 }
 
 /* 初筛：50% 按成交额（可交易性），30% 按 60 日正动量，20% 按最大回撤（超卖反弹候选）
-   行业 10% 上限，确保覆盖多个板块。回撤桶让市场下跌时也能抓住反弹机会。 */
+   行业 15% 上限（n=240 时每行业最多 36 只），放宽后板块集体行情不再被挡在门外。 */
 function prescreen(list, n) {
   if (!list.length) return [];
-  const secCap = Math.max(5, Math.ceil(n * 0.10));
+  const secCap = Math.max(5, Math.ceil(n * 0.15));
   const picked = [], seen = {}, secCnt = {};
   const push = (x, cap) => {
     if (seen[x.code] || (secCnt[x.ind] || 0) >= cap) return false;
