@@ -2892,10 +2892,12 @@ async function runAuctionScan() {
   state.auction.rows = scored.slice(0, 20);
   state.auction.ts = Date.now();
   state.auction.date = today;
-  /* 9:25 后定格当日结果，不再自动刷新 */
+  /* 9:25 后定格当日结果，不再自动刷新；开盘后拉取为实时快照，标注口径差异 */
   state.auction.frozen = phase === 'frozen' || phase === 'open';
-  state.auction.msg = state.auction.frozen
-    ? (phase === 'frozen' ? '9:25 定格 · 以下为今日竞价推荐' : '已开盘 · 以下为今日 9:25 定格推荐')
+  state.auction.msg = phase === 'open'
+    ? '已开盘 · 以下为实时行情快照（非当日 9:25 定格竞价数据，竞价评分仅供参考）'
+    : phase === 'frozen' ? '9:25 定格 · 以下为今日竞价推荐'
+    : phase === 'before' ? '盘前实时快照（竞价尚未开始，9:15 后口径更准确）'
     : '竞价中 · 每 10 秒刷新（9:25 前可撤单，数据仅供参考）';
   saveAuction();
   renderAuction();
@@ -4281,11 +4283,15 @@ function renderAuction() {
   if (phase === 'before') {
     banner = '<div class="notice warn"><b>未到集合竞价</b>：每日 9:15–9:25 为集合竞价阶段，9:25 撮合定格。当前可查看历史缓存。</div>';
   } else if (phase === 'open' && (!a.rows || !a.rows.length)) {
-    banner = '<div class="notice warn"><b>已开盘</b>：请在 9:25 前打开本页获取当日竞价推荐。</div>';
+    banner = '<div class="notice warn"><b>已开盘</b>：当日集合竞价已结束，可点击下方按钮拉取实时行情快照。</div>';
   }
 
   if (!a.rows || !a.rows.length) {
-    head.innerHTML = banner || '<div class="empty"><div class="ico">⏳</div><p>暂无竞价数据</p><p>请点击下方按钮拉取集合竞价快照</p><button class="btn" id="aucBtn">拉取竞价快照</button></div>';
+    /* 任何时段都允许手动拉取：竞价中=实时竞价快照，定格/开盘=实时行情快照（非 9:25 定格） */
+    head.innerHTML = (banner || '') +
+      '<div class="empty"><div class="ico">⏳</div><p>暂无竞价数据</p>' +
+      '<p>' + (phase === 'calling' ? '竞价进行中，数据实时变动' : phase === 'before' ? '现在可预览实时快照，9:15 竞价开始后自动锁定竞价口径' : '现在拉取为实时行情快照（非当日 9:25 定格数据）') + '</p>' +
+      '<button class="btn" id="aucBtn">拉取竞价快照</button></div>';
     const b = $('#aucBtn');
     if (b) b.onclick = () => runAuctionScan();
     return;
@@ -4325,7 +4331,7 @@ function renderAuction() {
   }).join('');
 
   const foot = '<div class="disc"><b>竞价交易风险：</b>9:15–9:20 可撤单，9:20 后不可撤单，9:25 为真实撮合价。建议只在 9:25 定格后按买入区间挂单；单只仓位 3–8%，严格止损。本工具不构成投资建议。</div>' +
-    (a.frozen ? '' : '<button class="btn" id="aucBtn" style="margin:14px auto">刷新竞价快照</button>');
+    '<button class="btn" id="aucBtn" style="margin:14px auto">' + (a.frozen ? '重新拉取实时快照' : '刷新竞价快照') + '</button>';
 
   head.innerHTML = headBar + '<div class="list">' + cards + '</div>' + foot;
   const b = $('#aucBtn');
@@ -5480,13 +5486,11 @@ function bindEvents() {
     state.tab = b.dataset.tab;
     if (state.tab === 'strategy') state.search = '';
     render();
-    /* 切到竞价页且处于竞价阶段时自动拉取一次 */
+    /* 切到竞价页：任何时段无当日数据都自动拉取一次；竞价中启动 10 秒自动刷新 */
     if (state.tab === 'auction') {
       const ph = auctionPhase();
-      if (ph === 'calling' || ph === 'frozen') {
-        if (!state.auction.frozen || !state.auction.rows.length) runAuctionScan();
-        startAuctionTimer();
-      }
+      if (!state.auction.rows.length || state.auction.date !== dayStr(new Date())) runAuctionScan();
+      if (ph === 'calling' || ph === 'frozen') startAuctionTimer();
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
