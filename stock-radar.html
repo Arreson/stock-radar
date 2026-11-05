@@ -441,7 +441,6 @@ canvas.chart{width:100%;display:block;border-radius:9px;background:rgba(255,255,
 <nav class="tabs" id="tabs">
   <button class="tab active" data-tab="long">长期持有</button>
   <button class="tab" data-tab="short">短线机会</button>
-  <button class="tab" data-tab="auction">竞价选股</button>
   <button class="tab" data-tab="review">盘后复盘</button>
   <button class="tab" data-tab="watch">自选</button>
   <button class="tab" data-tab="strategy">策略</button>
@@ -508,7 +507,7 @@ const state = {
   meta: {},            /* code -> {name, ind} */
   marketTotal: 0,      /* 全市场可选标的数（初筛前） */
   coverN: 0,           /* 本次深度分析的标的数 */
-  auction: { rows: [], ts: 0, frozen: false, date: '', msg: '' },
+  auction: { rows: [], ts: 0, frozen: false, date: '', msg: '', phase: '' },
   btCost: 0.3,         /* 回测双边成本（%） */
   btRange: null        /* 回测样本区间 [起始日期, 结束日期] */
 };
@@ -3076,7 +3075,7 @@ function scoreAuction(r) {
 
 async function runAuctionScan() {
   state.auction.msg = '拉取竞价快照…';
-  renderAuction();
+  paintAuction();
   const rows = await fetchAuctionSnapshot();
   const scored = rows.map(scoreAuction).filter(Boolean)
     .sort((a, b) => b.score - a.score || b.amtYi - a.amtYi);
@@ -3085,6 +3084,7 @@ async function runAuctionScan() {
   state.auction.rows = scored.slice(0, 20);
   state.auction.ts = Date.now();
   state.auction.date = today;
+  state.auction.phase = phase;
   /* 9:25 后定格当日结果，不再自动刷新；开盘后拉取为实时快照，标注口径差异 */
   state.auction.frozen = phase === 'frozen' || phase === 'open';
   state.auction.msg = phase === 'open'
@@ -3093,7 +3093,7 @@ async function runAuctionScan() {
     : phase === 'before' ? '盘前实时快照（竞价尚未开始，9:15 后口径更准确）'
     : '竞价中 · 每 10 秒刷新（9:25 前可撤单，数据仅供参考）';
   saveAuction();
-  renderAuction();
+  paintAuction();
 }
 
 async function fetchMarketList(onProgress) {
@@ -3314,7 +3314,7 @@ async function refreshFull(opts) {
       try {
         if (!state.limitStats || state.limitStats.date !== (state.lastDate || dayStr(new Date()))) {
           computeLimitUpStats();
-          if (state.tab === 'auction') renderAuction();
+          paintAuction();
         }
       } catch (e) {}
     })();
@@ -3641,7 +3641,8 @@ async function ensureAllWatch() {
   await Promise.all(codes.map(c => ensureWatchStock(c)));
   /* 拉完触发 renderWatch（如果当前 Tab 是 watch）或 renderList */
   if (state.tab === 'watch') renderWatch();
-  else if (state.tab === 'long' || state.tab === 'short') renderList();
+  else if (state.tab === 'short') { if (showAuctionFirst()) renderAuction(); else renderList(); }
+  else if (state.tab === 'long') renderList();
   else if (state.tab === 'review') renderReview();
 }
 
@@ -3972,7 +3973,10 @@ function cardHTML(x, mode, rank) {
     const ndColor = nd.prob >= 55 ? 'var(--green)' : nd.prob >= 50 ? 'var(--yellow)' : 'var(--red)';
     nextDayMark = '<em style="color:' + ndColor + ';font-weight:600" title="次日收阳概率（12年实测条件概率）">次日↑' + nd.prob.toFixed(0) + '%</em>';
   }
-  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark;
+  /* 竞价 × 短线合并：若该票出现在今日竞价 Top20，标注竞价涨幅（仅标注，不影响评分/过滤） */
+  const au = m === 'short' ? auctionHit(x.code) : null;
+  const auMark = au ? '<em style="color:var(--cyan)">竞价' + signTxt(au.pct) + '</em>' : '';
+  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark + (nextDayMark && auMark ? ' ' : '') + auMark;
   const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.setupName || '') +
     (s.winRate3 != null && s.winRate != null
       ? ' · 3日胜率 ' + s.winRate3 + '% / 5日胜率 ' + s.winRate + '%'
@@ -4008,6 +4012,7 @@ function rowHTML(x, mode, rank) {
 
 function renderList() {
   const mode = state.tab === 'short' ? 'short' : 'long';
+  state.auctionView = false;
   renderIndustryRow();
   const arr = sortedList(mode);
   const head = $('#list');
@@ -4114,6 +4119,8 @@ function renderList() {
       ? '<b>大盘下行（熊市）</b>：熊市白名单「弱势反抽 + 超卖反弹 + 趋势延续 + 逆势强势」。量比≥1.2 且 J<80 的量价确认已生效：11 年实测过滤后 3 日胜率 51.4%、5 日 51.1%（基线 48.1% / 48.5%）。'
       : '<b>大盘多头（牛市）</b>：牛市白名单「放量突破 + 趋势延续」。量价确认后 11 年实测：3 日胜率 <b>53.1%</b>、5 日 <b>53.9%</b>（基线 49.9% / 49.6%），放量突破过滤后 5 日 55.5% 为最强形态。'
     ) + '</div>';
+    /* 竞价 × 短线合并：开盘后保留当日竞价回顾条（9:25 定格 / 实时快照） */
+    html += auctionStrip();
   }
   /* 资金面情绪行：两融杠杆（T+1）+ 涨跌停温度（实时快照） */
   if (!state.search) {
@@ -4513,6 +4520,7 @@ function reviewCollect() {
 
 function renderAuction() {
   const head = $('#list');
+  state.auctionView = true;
   const phase = auctionPhase();
   const today = dayStr(new Date());
   const a = state.auction;
@@ -4540,10 +4548,11 @@ function renderAuction() {
   /* 涨停预测汇总：Top15 触板概率求和 = 期望触板只数（11 年日线实测近似口径） */
   a.rows.forEach(r => { if (!isNum(r.limitProb)) r.limitProb = limitUpProb(r.code, r.pct, isNum(r.volRatio) ? r.volRatio : 1); });
   const expLimit = a.rows.slice(0, 15).reduce((s, r) => s + r.limitProb, 0) / 100;
-  const headBar = '<div class="sec"><b>竞价推荐 · ' + a.date + '</b>' +
+  const headBar = '<div class="sec"><b>短线 · 竞价阶段 · ' + a.date + '</b>' +
     '<span>' + (a.ts ? new Date(a.ts).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '') + '</span></div>' +
     '<div class="notice ' + phaseCls + '">' + a.msg +
-    ' <b>今日 Top15 预计触板约 ' + expLimit.toFixed(1) + ' 只</b>（开盘涨幅×量比历史统计近似，触板≠封板，20cm 票已折算）</div>';
+    ' <b>今日 Top15 预计触板约 ' + expLimit.toFixed(1) + ' 只</b>（开盘涨幅×量比历史统计近似，触板≠封板，20cm 票已折算）' +
+    '<div style="margin-top:4px;color:var(--muted)">9:30 开盘后自动切换为短线机会列表；竞价只做情境参考，不做高开硬门槛（实测高开≥1% 的 3 日胜率 49.6%，低于基准 52.1%）。</div></div>';
 
   const cards = a.rows.slice(0, 15).map((r, i) => {
     const pctCls = r.pct >= 0 ? 'up' : 'down';
@@ -4582,8 +4591,58 @@ function renderAuction() {
   const b = $('#aucBtn');
   if (b) b.onclick = () => runAuctionScan();
   const lb = $('#lsBtn');
-  if (lb) lb.onclick = () => { computeLimitUpStats(); renderAuction(); };
+  if (lb) lb.onclick = () => { computeLimitUpStats(); paintAuction(); };
   $$('#list .card.auction').forEach(c => c.onclick = () => openDetail(c.dataset.code));
+}
+
+/* ---------------- 竞价 × 短线 合并 ----------------
+   · 交易日 9:15–9:30：短线机会页优先展示当日竞价推荐，9:30 自动切回短线列表
+   · 9:30 后：短线列表顶部保留当日竞价回顾条，个股卡片标注竞价涨幅
+   · 竞价数据只做展示/情境标注，不做硬过滤（回测：高开≥1% 3日 49.6%/5日 51.7%，劣于基准 52.1%/52.3%） */
+function showAuctionFirst() {
+  if (state.tab !== 'short') return false;
+  if (state.search || state.ind !== '全部') return false;
+  const d = new Date();
+  if (d.getDay() === 0 || d.getDay() === 6) return false;
+  const p = auctionPhase();
+  return p === 'calling' || p === 'frozen';
+}
+
+/* 仅返回当日有效的竞价结果 */
+function auctionToday() {
+  const a = state.auction;
+  return (a && a.rows && a.rows.length && a.date === dayStr(new Date())) ? a : null;
+}
+
+function auctionHit(code) {
+  const a = auctionToday();
+  if (!a) return null;
+  for (const r of a.rows) if (r.code === code) return r;
+  return null;
+}
+
+/* 开盘后短线列表顶部的竞价回顾条 */
+function auctionStrip() {
+  const a = auctionToday();
+  if (!a) return '';
+  a.rows.forEach(r => { if (!isNum(r.limitProb)) r.limitProb = limitUpProb(r.code, r.pct, isNum(r.volRatio) ? r.volRatio : 1); });
+  const exp = a.rows.slice(0, 15).reduce((s, r) => s + r.limitProb, 0) / 100;
+  const top = a.rows.slice(0, 6).map(r =>
+    '<b>' + r.name + '</b> <span class="' + (r.pct >= 0 ? 'up' : 'down') + '">' + signTxt(r.pct) + '</span>'
+  ).join('、');
+  const tag = a.phase === 'open' ? '实时快照' : '9:25 定格';
+  return '<div class="notice" style="font-size:11px;padding:6px 10px">' +
+    '🔔 <b>今日竞价（' + tag + '）</b>：' + top +
+    ' · Top15 预计触板约 <b>' + exp.toFixed(1) + ' 只</b>' +
+    '<span style="color:var(--muted)"> · 竞价仅作情境标注，不参与过滤</span></div>';
+}
+
+/* 竞价页/短线页统一重绘入口：只影响当前「短线」页，其它页不打断 */
+function paintAuction() {
+  if (state.tab !== 'short') return;
+  if (state.search || state.ind !== '全部') return;
+  if (showAuctionFirst()) renderAuction();
+  else renderList();
 }
 
 /* 测算引擎面板：展示实测触板率矩阵 + 昨日信号组合 */
@@ -5764,11 +5823,13 @@ function bindEvents() {
     state.tab = b.dataset.tab;
     if (state.tab === 'strategy') state.search = '';
     render();
-    /* 切到竞价页：任何时段无当日数据都自动拉取一次；竞价中启动 10 秒自动刷新 */
-    if (state.tab === 'auction') {
+    /* 竞价 × 短线合并：9:15–9:30 切到短线页，自动拉当日竞价并启动 10 秒刷新 */
+    if (state.tab === 'short') {
       const ph = auctionPhase();
-      if (!state.auction.rows.length || state.auction.date !== dayStr(new Date())) runAuctionScan();
-      if (ph === 'calling' || ph === 'frozen') startAuctionTimer();
+      if (ph === 'calling' || ph === 'frozen') {
+        if (!auctionToday()) runAuctionScan();
+        startAuctionTimer();
+      }
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
@@ -5777,7 +5838,11 @@ function bindEvents() {
   $('#searchInput').addEventListener('input', e => {
     state.search = e.target.value.trim();
     clearTimeout(timer);
-    timer = setTimeout(() => { if (state.tab === 'long' || state.tab === 'short') renderList(); }, 180);
+    timer = setTimeout(() => {
+      if (state.tab === 'long' || state.tab === 'short') {
+        if (showAuctionFirst()) renderAuction(); else renderList();
+      }
+    }, 180);
   });
 
   $('#industryRow').addEventListener('click', e => {
@@ -5785,7 +5850,7 @@ function bindEvents() {
     if (!b) return;
     state.ind = b.dataset.ind;
     $$('.fchip', $('#industryRow')).forEach(x => x.classList.toggle('active', x.dataset.ind === state.ind));
-    renderList();
+    if (showAuctionFirst()) renderAuction(); else renderList();
   });
 
   $('#list').addEventListener('click', e => {
@@ -5845,7 +5910,7 @@ function render() {
   if (isStrategy) renderStrategy();
   else if (state.tab === 'watch') renderWatch();
   else if (state.tab === 'review') renderReview();
-  else if (state.tab === 'auction') renderAuction();
+  else if (showAuctionFirst()) renderAuction();
   else renderList();
   const n = Object.keys(state.data).length;
   const scope = state.marketTotal && n
@@ -5877,19 +5942,26 @@ function startAutoRefresh() {
   }, 60000);
 }
 
-/* 集合竞价阶段自动刷新快照（9:15–9:25 每 10s，9:25 后定格） */
+/* 集合竞价 × 短线：9:15–9:25 每 10s 刷新竞价快照，9:25 定格，9:30 自动切回短线列表 */
 function stopAuctionTimer() {
   if (state.auctionTimer) { clearInterval(state.auctionTimer); state.auctionTimer = 0; }
 }
 function startAuctionTimer() {
   stopAuctionTimer();
-  const ph = auctionPhase();
-  if (ph !== 'calling') return;
+  const d = new Date();
+  if (d.getDay() === 0 || d.getDay() === 6) return;
+  const hm = d.getHours() * 60 + d.getMinutes();
+  if (hm < 480 || hm >= 570) return;      /* 只在 8:00–9:30 启用，开盘后不需要 */
   state.auctionTimer = setInterval(() => {
     if (document.hidden) return;
     const p = auctionPhase();
-    if (p === 'frozen' || p === 'open') { stopAuctionTimer(); runAuctionScan(); return; }
-    if (!state.auction.frozen) runAuctionScan();
+    if (p === 'before') return;           /* 8:00–9:15：等待竞价开始 */
+    if (p === 'calling') { if (!state.auction.frozen) runAuctionScan(); return; }
+    if (p === 'frozen') { if (!state.auction.frozen) runAuctionScan(); return; }
+    /* 9:30 开盘：停止竞价刷新，短线机会页切回短线列表 */
+    stopAuctionTimer();
+    render();
+    startAutoRefresh();
   }, 10000);
 }
 
@@ -5900,6 +5972,9 @@ async function init() {
   loadLongBacktest();
   loadNorth();
   loadLimitStats();
+  /* 竞价 × 短线合并：交易日 9:15–9:30 打开应用，默认进入短线机会页并直接展示当日竞价 */
+  const ph0 = auctionPhase();
+  if (ph0 === 'calling' || ph0 === 'frozen') state.tab = 'short';
   bindEvents();
   const pack = await readCache();
   if (pack) {
@@ -5915,9 +5990,16 @@ async function init() {
   }
   startAutoRefresh();
   startAuctionTimer();
+  /* 竞价时段自动拉起当日竞价推荐（与短线列表合并展示） */
+  if (state.tab === 'short' && (ph0 === 'calling' || ph0 === 'frozen') && !auctionToday()) runAuctionScan();
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) { stopAutoRefresh(); stopAuctionTimer(); }
-    else { startAutoRefresh(); startAuctionTimer(); }
+    else {
+      startAutoRefresh();
+      startAuctionTimer();
+      /* 页面在后台跨过 9:30：回到前台时立即从竞价页切回短线列表 */
+      if (state.tab === 'short' && state.auctionView && auctionPhase() === 'open') render();
+    }
   });
 }
 
