@@ -1250,6 +1250,11 @@ function scoreShort(x, ctx) {
     if (ctx.margin5d >= 0.5) { score = clamp(score + 2, 0, 100); reasons.push('融资余额5日+' + ctx.margin5d.toFixed(1) + '%·杠杆进场'); }
     else if (ctx.margin5d <= -1.5) { score = clamp(score - 2, 0, 100); risks.push('融资余额5日' + ctx.margin5d.toFixed(1) + '%·杠杆撤退'); }
   }
+  /* 北向十大活跃股（披露新政后仅热度口径）：命中 +2 */
+  if (ctx.north10) {
+    const nb = ctx.north10[x.code.slice(2)];
+    if (nb) { score = clamp(score + 2, 0, 100); reasons.push('北向十大活跃·' + nb.side + '第' + nb.rank + '名·成交' + nb.dealYi + '亿'); }
+  }
   if (setup === 'resilient') reasons.push('逆势强势');
   if (I.limitStreak >= 2) reasons.push('连板 ' + I.limitStreak + ' 天');
   else if (I.limitStreak === 1) reasons.push('涨停首板');
@@ -2138,6 +2143,8 @@ function scoreAll() {
   }
   /* 融资融券杠杆情绪（路线B：fetchMarginSentiment 异步填充 state.margin） */
   if (state.margin && isNum(state.margin.chg5d)) ctx.margin5d = state.margin.chg5d;
+  /* 北向十大活跃股（T 日盘后发布，热度信号无方向） */
+  if (state.north && state.north.top10) ctx.north10 = state.north.top10;
   list.forEach(x => { x.long = scoreLong(x, ctx); x.short = scoreShort(x, ctx); });
   state.scoredCount = list.length;
 }
@@ -2279,6 +2286,70 @@ async function fetchMarginSentiment() {
       chg5d: isNum(+latest.ZDF5D) ? +(+latest.ZDF5D).toFixed(2) : null,
     };
     return state.margin;
+  } catch (e) { return null; }
+}
+
+/* —— 北向资金（2024-08 披露新政后可用口径）——
+   ① 个股：RPT_MUTUAL_TOP10DEAL 每日"北向十大活跃股"（沪股通001/深股通003），
+      含 RANK 与 DEAL_AMT 成交额（净买入自新政后 null，不可用），T 日盘后发布
+   ② 市场：kamt 接口 hk2sh/hk2sz.buySellAmt = 北向成交额（万元，快照），
+      本地滚动历史算 20 日均值判断放量
+   用法：命中十大活跃股 scoreShort +2（热度信号，无方向）；成交额放量仅展示 */
+const NORTH_KEY = 'qr_north_v1';
+function loadNorth() {
+  try { const j = JSON.parse(localStorage.getItem(NORTH_KEY) || 'null'); if (j && j.top10) state.north = j; } catch (e) {}
+}
+function saveNorth() { try { localStorage.setItem(NORTH_KEY, JSON.stringify(state.north || {})); } catch (e) {} }
+
+async function fetchNorthSentiment() {
+  try {
+    const today = shToday();
+    const cached = state.north;
+    /* 十大活跃股：盘后发布，同日缓存直接复用 */
+    let top10 = cached && cached.t10date && cached.top10 ? cached.top10 : null;
+    let t10date = cached && cached.t10date;
+    if (!top10 || cached.t10fetch !== today) {
+      const cols = '&columns=SECURITY_CODE,TRADE_DATE,RANK,DEAL_AMT&pageSize=10&sortColumns=TRADE_DATE,RANK&sortTypes=-1,1&source=WEB&client=WEB';
+      const [j1, j3] = await Promise.all([
+        dcJSON('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_MUTUAL_TOP10DEAL&filter=(MUTUAL_TYPE%3D%22001%22)' + cols, 9000),
+        dcJSON('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_MUTUAL_TOP10DEAL&filter=(MUTUAL_TYPE%3D%22003%22)' + cols, 9000),
+      ]);
+      const map = {};
+      let latest = '';
+      [['001', j1, '沪股通'], ['003', j3, '深股通']].forEach(([, j, side]) => {
+        const rows = j && j.result && j.result.data;
+        if (!rows || !rows.length) return;
+        const d = String(rows[0].TRADE_DATE || '').slice(0, 10);
+        if (d > latest) latest = d;
+        rows.filter(r => String(r.TRADE_DATE || '').slice(0, 10) === d).forEach(r => {
+          const c = String(r.SECURITY_CODE || '');
+          if (!map[c]) map[c] = { rank: +r.RANK || 0, dealYi: +((+r.DEAL_AMT || 0) / 1e8).toFixed(1), side };
+        });
+      });
+      if (Object.keys(map).length) { top10 = map; t10date = latest; }
+    }
+    /* 市场级成交额快照（万元 → 亿），本地滚动历史 */
+    let toYi = null;
+    try {
+      const k = await emJSON('https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f3&fields2=f51,f56,f62', 8000);
+      const d = k && k.data;
+      if (d) {
+        const wan = (+((d.hk2sh || {}).buySellAmt) || 0) + (+((d.hk2sz || {}).buySellAmt) || 0);
+        if (wan > 0) toYi = +(wan / 1e4).toFixed(0);
+      }
+    } catch (e) {}
+    const hist = (cached && Array.isArray(cached.hist) ? cached.hist : []).filter(h => h && h.d && isNum(h.v));
+    if (toYi != null && (!hist.length || hist[hist.length - 1].d !== today)) hist.push({ d: today, v: toYi });
+    while (hist.length > 60) hist.shift();
+    const vs = hist.slice(-20).map(h => h.v);
+    const avg20Yi = vs.length >= 5 ? +(vs.reduce((a, b) => a + b, 0) / vs.length).toFixed(0) : null;
+    state.north = {
+      date: today, t10date: t10date || '', t10fetch: today, top10: top10 || {},
+      toYi, avg20Yi, hot: toYi != null && avg20Yi != null && toYi >= avg20Yi * 1.2,
+      hist,
+    };
+    saveNorth();
+    return state.north;
   } catch (e) { return null; }
 }
 
@@ -3111,6 +3182,11 @@ async function refreshFull(opts) {
       const mg = await fetchMarginSentiment();
       if (mg && isNum(mg.chg5d)) { scoreAll(); render(); }
     })();
+    /* ★ 北向资金异步补充：十大活跃股 +2 分、成交额快照进资金面行 */
+    (async () => {
+      const nb = await fetchNorthSentiment();
+      if (nb && (Object.keys(nb.top10 || {}).length || nb.toYi != null)) { scoreAll(); render(); }
+    })();
     /* ★ 分钟级数据异步补充：拉 Top 15 短线精选票的 5 分钟线，
        计算 VWAP/早盘/尾盘 等日内因子，不阻塞主流程 */
     (async () => {
@@ -3901,6 +3977,13 @@ function renderList() {
     if (state.mktSenti && state.mktSenti.total) {
       const ms = state.mktSenti;
       bits.push('涨停 <b>' + ms.limitUp + '</b> 家 · 跌停 <b>' + ms.limitDown + '</b> 家 · 涨超5% ' + ms.up5 + ' 家');
+    }
+    if (state.north && state.north.toYi != null) {
+      const nb = state.north;
+      bits.push('北向成交 ¥' + nb.toYi + ' 亿' + (nb.avg20Yi ? '（20日均 ' + nb.avg20Yi + ' 亿' + (nb.hot ? ' · <b class="up">放量</b>' : '') + '）' : ''));
+    }
+    if (state.north && state.north.t10date && Object.keys(state.north.top10 || {}).length) {
+      bits.push('北向十大活跃（' + state.north.t10date + '）已计入评分 +2');
     }
     if (bits.length) html += '<div class="notice" style="font-size:11px;padding:6px 10px">📊 ' + bits.join(' ｜ ') + '</div>';
   }
@@ -5620,6 +5703,7 @@ async function init() {
   loadAuction();
   loadBacktest();
   loadLongBacktest();
+  loadNorth();
   bindEvents();
   const pack = await readCache();
   if (pack) {
