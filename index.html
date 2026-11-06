@@ -1275,7 +1275,12 @@ function scoreShort(x, ctx) {
   }
 
   return {
-    score, parts, reasons: reasons.slice(0, 5), risks: risks.slice(0, 4), obsTags,
+    score, parts,
+    /* 执行分：仅由执行质量（流动性/波动/收益成本比）归一，是短线唯一排序键。
+       综合分 score 保留为研究口径（未通过样本外验证），不再用于排序与展示 */
+    exec: Math.round(clamp(parts[4].v, 0, 15) / 15 * 100),
+    vr5, jv: J,
+    reasons: reasons.slice(0, 5), risks: risks.slice(0, 4), obsTags,
     pool, poolName: pool === 'oversold' ? '超跌反弹池' : '主池',
     setup, setupName: S.name, setupNote: S.note,
     winRate: si.wr, avgRet: si.avgRet, winRate3: si.wr3, avgRet3: si.avgRet3,
@@ -3967,7 +3972,7 @@ async function refreshFull(opts) {
        计算 VWAP/早盘/尾盘 等日内因子，不阻塞主流程 */
     (async () => {
       try {
-        const sorted = sortedList('short').filter(x => x.short.score >= 50 && shortWhitelistFor(state.marketUp)[x.short.setup] !== false);
+        const sorted = sortedList('short').filter(x => x.short.exec >= 50 && shortWhitelistFor(state.marketUp)[x.short.setup] !== false);
         const topCodes = sorted.slice(0, 15).map(x => x.code);
         const minuteData = await batchFetchMinuteBars(topCodes, 5);
         let updated = 0;
@@ -4585,34 +4590,17 @@ function diversify(arr) {
 function sortedList(mode) {
   let arr = Object.values(state.data).filter(x => x.long && x.short);
   arr = arr.filter(x => matchQuery(x, state.search) && (state.ind === '全部' || x.sector === state.ind));
-  arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score : b.short.score - a.short.score);
+  /* 短线排序键 = 执行分（风控口径，非收益预测）；综合分已因未通过样本外验证退出排序 */
+  arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score : (b.short.exec || 0) - (a.short.exec || 0));
   return arr;
 }
 
 function scoreMode(mode) { return mode === 'short' ? 'short' : 'long'; }
 
-/* 横截面分位：在当前扫描池内按分数升序给予 0–100 分位（100 = 池内最高）。
-   行业分位仅在行业样本 ≥5 时给出；池内样本 <20 时不标注，避免小样本误导。 */
-function annotatePercentiles(arr, mode) {
-  const m = scoreMode(mode);
-  const rows = (arr || []).filter(x => x[m] && isNum(x[m].score));
-  if (rows.length < 20) return;
-  const sorted = rows.slice().sort((a, b) => a[m].score - b[m].score);
-  const n = sorted.length;
-  sorted.forEach((x, i) => { x[m].pctAll = n > 1 ? Math.round(i / (n - 1) * 100) : 50; });
-  const g = {};
-  rows.forEach(x => { const k = x.sector || '其他'; (g[k] = g[k] || []).push(x); });
-  Object.values(g).forEach(list => {
-    if (list.length < 5) { list.forEach(x => { x[m].pctInd = null; }); return; }
-    list.sort((a, b) => a[m].score - b[m].score);
-    list.forEach((x, i) => { x[m].pctInd = Math.round(i / (list.length - 1) * 100); });
-  });
-}
-
 function cardHTML(x, mode, rank) {
   const m = scoreMode(mode);
   const s = m === 'short' ? x.short : x.long;
-  const score = s.score;
+  const score = m === 'short' ? (s.exec || 0) : s.score;   /* 短线环显执行分 */
   const pctCls = x.pct >= 0 ? 'up' : 'down';
   const reasons = s.reasons.slice(0, 4);
   const chipCls = m === 'short' ? 'c' : 'g';
@@ -4648,11 +4636,8 @@ function cardHTML(x, mode, rank) {
   const au = m === 'short' ? auctionHit(x.code) : null;
   const auMark = au ? '<em style="color:var(--cyan)">竞价' + signTxt(au.pct) + '</em>' : '';
   const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark + (nextDayMark && auMark ? ' ' : '') + auMark;
-  /* 横截面分位（池内/行业）：让不同形态的分数可横向比较 */
-  const pctMark = (m === 'short' && isNum(s.pctAll))
-    ? ' · 池内前 ' + (100 - s.pctAll) + '%' + (isNum(s.pctInd) ? ' / 行业前 ' + (100 - s.pctInd) + '%' : '')
-    : '';
-  const footShort = '短线 ' + fmt(score, 1) + ' · ' + (s.pool === 'oversold' ? '超跌池·' : '') + (s.setupName || '') + pctMark +
+  const footShort = '执行 ' + Math.round(s.exec || 0) + ' · ' + (s.pool === 'oversold' ? '超跌观察池·' : '') + (s.setupName || '') +
+    ' · 量比 ' + (isNum(s.vr5) ? fmt(s.vr5, 1) : '—') + ' / J ' + (isNum(s.jv) ? fmt(s.jv, 0) : '—') +
     (s.winRate3 != null && s.winRate != null
       ? ' · 3日胜率 ' + s.winRate3 + '% / 5日胜率 ' + s.winRate + '%'
       : (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '')) +
@@ -4680,7 +4665,7 @@ function cardHTML(x, mode, rank) {
 
 function rowHTML(x, mode, rank) {
   const m = scoreMode(mode);
-  const score = m === 'short' ? x.short.score : x.long.score;
+  const score = m === 'short' ? (x.short.exec || 0) : x.long.score;
   const pctCls = x.pct >= 0 ? 'up' : 'down';
   return '<div class="row" data-code="' + x.code + '">' +
     '<span class="rk num">' + rank + '</span>' +
@@ -4695,7 +4680,6 @@ function renderList() {
   state.auctionView = false;
   renderIndustryRow();
   const arr = sortedList(mode);
-  annotatePercentiles(arr, mode);
   const head = $('#list');
   if (!Object.keys(state.data).length) {
     head.innerHTML = '<div class="empty"><div class="ico">◌</div><p>尚无行情数据</p><p>请点击右上角「刷新」拉取行情</p></div>';
@@ -4738,7 +4722,7 @@ function renderList() {
       /* 同一交易日内重复渲染（刷新/量化快照回填）不应把当天已展示的信号冷却掉，
          否则二次渲染会得到空列表；冷却从次日开始计算 */
       if (prevHit && prevHit !== today && prevHit >= cutoff) return false;
-      if (!(x.short.score >= 50)) return false;
+      /* 综合分门槛已移除：未通过样本外验证的分数不作为过滤条件（诚实口径） */
       if (!volOK(x)) return false;
       const J = x.ind ? last(x.ind.J) : NaN;
       if (isFinite(J) && J >= 80) return false;                           /* J>80 超买，次日回落概率高 */
@@ -4818,9 +4802,9 @@ function renderList() {
     html += '<div class="notice' + (gateOK ? '' : ' warn') + '">' + (
       gateOK
         ? '<b>评分已通过样本外门槛</b>：Q5−Q1 5 日胜率/均收为正，组合 Sharpe ' + pf.sharpe + '、Calmar ' + pf.calmar + '。'
-        : '<b>评分未通过样本外门槛，仅作排序展示，不构成推荐。</b>' +
+        : '<b>短线综合分未通过样本外验证，已退出排序与展示。</b>推荐名单 = 形态白名单 + 量比≥1.2 + J&lt;80（11 年实测有效），池内按执行分（流动性/波动/收益成本比）排序，不构成收益预测。' +
           (vv && vv.length >= 2
-            ? ' Q5−Q1：5 日均收 ' + ((vv[vv.length - 1].avg5 - vv[0].avg5) >= 0 ? '+' : '') + (vv[vv.length - 1].avg5 - vv[0].avg5).toFixed(2) + 'pp、5 日胜率 ' + (vv[vv.length - 1].wr5 - vv[0].wr5) + 'pp'
+            ? ' 验证记录 Q5−Q1：5 日均收 ' + ((vv[vv.length - 1].avg5 - vv[0].avg5) >= 0 ? '+' : '') + (vv[vv.length - 1].avg5 - vv[0].avg5).toFixed(2) + 'pp、5 日胜率 ' + (vv[vv.length - 1].wr5 - vv[0].wr5) + 'pp'
             : ' 尚未跑滚动回测') +
           (pf ? '；组合 Sharpe ' + pf.sharpe + ' / Calmar ' + pf.calmar + '（门槛 0.5 / 0.3）' : '')
     ) + '</div>';
@@ -4851,17 +4835,17 @@ function renderList() {
   }
 
   if (mode === 'short' && !filtered.length && !state.search && state.ind === '全部') {
-    const topNow = arr.filter(x => x.short && isNum(x.short.score)).slice(0, 5)
-      .map(x => x.name + ' ' + fmt(x.short.score, 1)).join(' · ');
+    const topNow = arr.filter(x => x.short && isNum(x.short.exec)).slice(0, 5)
+      .map(x => x.name + ' 执行' + Math.round(x.short.exec)).join(' · ');
     html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J&lt;80 的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
-      (topNow ? '<p style="font-size:11px;color:var(--muted)">池内最高分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
+      (topNow ? '<p style="font-size:11px;color:var(--muted)">池内最高执行分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
       '<div class="disc"><b>风险提示：</b>不构成投资建议。</div>';
     head.innerHTML = html;
     return;
   }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (oversoldX.length) {
-    html += '<div class="sec"><b>超跌反弹池（独立）</b><span>' + oversoldX.length + ' 只 · 仅熊市 + J&lt;20 + 缩量止跌 + 站回 5 日线，单独排序</span></div>' +
+    html += '<div class="sec"><b>超跌反弹池（观察 · 未单独验证）</b><span>' + oversoldX.length + ' 只 · 仅熊市 + J&lt;20 + 缩量止跌 + 站回 5 日线；独立列示，不与主池比较，不构成推荐</span></div>' +
       '<div class="list">' + oversoldX.slice(0, 6).map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   }
   if (rest.length) {
@@ -5040,7 +5024,7 @@ function renderWatch() {
 
   html += filteredArr.map(({ code, x, meta, adv, cyqShape, cyqShapeName, nd }) => {
     const pctCls = x.pct >= 0 ? 'up' : 'down';
-    const ws = Math.max(x.long.score, x.short.score);
+    const ws = Math.max(x.long.score, x.short.exec || 0);
 
     /* —— 浮盈徽章（锚定价 vs 当前价）—— */
     let badgeHTML = '';
@@ -5086,7 +5070,7 @@ function renderWatch() {
       '<circle class="rv" cx="32" cy="32" r="27" stroke-dasharray="' + (2 * Math.PI * 27 * ws / 100).toFixed(1) + ' ' + (2 * Math.PI * 27).toFixed(1) + '"></circle></svg>' +
       '<span class="num">' + Math.round(ws) + '</span></div>' +
       '<div class="ci"><div class="nm">' + x.name + '<span class="cd">' + code.slice(2) + '</span></div>' +
-      '<div class="meta">' + x.sector + ' · 长线 ' + fmt(x.long.score, 0) + ' / 短线 ' + fmt(x.short.score, 0) + '</div></div>' +
+      '<div class="meta">' + x.sector + ' · 长线 ' + fmt(x.long.score, 0) + ' / 短线执行 ' + fmt(x.short.exec || 0, 0) + '</div></div>' +
       '<div class="px"><b class="num">' + fmt(x.price) + '</b><small class="num ' + pctCls + '">' + signTxt(x.pct) + '</small></div></div>' +
       '<canvas class="spark" data-code="' + code + '"></canvas>' +
       adviceRow +
@@ -5211,7 +5195,7 @@ function reviewCollect() {
   if (wArr.length) pool = wArr.concat(partial);
   else {
     const topLong = all.slice().sort((a, b) => b.long.score - a.long.score).slice(0, 20);
-    const topShort = all.slice().sort((a, b) => b.short.score - a.short.score).slice(0, 20);
+    const topShort = all.slice().sort((a, b) => (b.short.exec || 0) - (a.short.exec || 0)).slice(0, 20);
     const set = new Set([...topLong, ...topShort].map(x => x.code));
     pool = all.filter(x => set.has(x.code));
   }
@@ -5220,11 +5204,11 @@ function reviewCollect() {
     const lb = b[b.length - 1] || {}, pb = b[b.length - 2] || {};
     const dayRet = isNum(x.pct) ? x.pct : (pb.c ? (lb.c / pb.c - 1) * 100 : 0);
     const intra = lb.o ? (lb.c / lb.o - 1) * 100 : 0;
-    const bestMode = (x.short.score || 0) >= (x.long.score || 0) ? 'short' : 'long';
+    const bestMode = (x.short.exec || 0) >= (x.long.score || 0) ? 'short' : 'long';
     return {
       x, dayRet, intra,
       mode: bestMode,
-      score: bestMode === 'short' ? x.short.score : x.long.score,
+      score: bestMode === 'short' ? x.short.exec : x.long.score,
       setup: bestMode === 'short' ? (x.short.setupName || '短线') : '长线持有'
     };
   });
@@ -5711,10 +5695,14 @@ function renderDetail() {
   const risks = s.risks.length
     ? s.risks.map(r => '<span class="chip">' + r + '</span>').join('')
     : '<span class="chip">暂无显著技术风险信号</span>';
-  const rating = s.score >= 85 ? '强' : s.score >= 75 ? '较强' : s.score >= 65 ? '中性偏强' : s.score >= 50 ? '中性' : '偏弱';
+  /* 短线评级基于执行分（综合分已退出展示口径） */
+  const sVal = mode === 'short' ? (s.exec || 0) : s.score;
+  const rating = sVal >= 85 ? '强' : sVal >= 75 ? '较强' : sVal >= 65 ? '中性偏强' : sVal >= 50 ? '中性' : '偏弱';
   const setupBlock = mode === 'short'
     ? '<div class="rr"><h4>短线形态 · ' + (s.setupName || '—') + ' · ' + (s.pool === 'oversold' ? '超跌独立池' : '主池') + '</h4>' +
       '<div class="chips"><span class="chip">' + (s.winRate != null ? '5日胜率 ' + s.winRate + '%' + (s.samples >= 30 ? ' · n=' + s.samples : '') : '胜率 —') + '</span>' +
+      '<span class="chip">执行 ' + (s.exec || 0) + '</span>' +
+      '<span class="chip">量比 ' + (isNum(s.vr5) ? fmt(s.vr5, 1) : '—') + ' / J ' + (isNum(s.jv) ? fmt(s.jv, 0) : '—') + '</span>' +
       '<span class="chip">建议持有 ' + (s.hold || '—') + '</span>' +
       '<span class="chip">' + (s.regime === 'down' ? '大盘下行' : '大盘多头') + '</span></div>' +
       '<p style="margin:8px 0 0;font-size:11px;line-height:1.6;color:var(--muted)">' + (s.setupNote || '') + '</p></div>'
@@ -5780,12 +5768,12 @@ function renderDetail() {
       '<div class="stat"><div class="k">52周区间</div><div class="v num">' + fmt(x.lo52) + ' – ' + fmt(x.hi52) + '</div></div>' +
     '</div>' +
     '<div class="scorebox">' +
-      '<div class="sb-top"><div class="sb-score num">' + fmt(s.score, 1) + '<small>分</small></div>' +
-        '<div class="sb-lb"><b>' + (mode === 'long' ? '长期持有评分 · ' : '短期机会评分 · ') + rating +
+      '<div class="sb-top"><div class="sb-score num">' + fmt(sVal, 1) + '<small>分</small></div>' +
+        '<div class="sb-lb"><b>' + (mode === 'long' ? '长期持有评分 · ' : '短线执行分 · ') + rating +
           (mode === 'short' && s.setupName ? ' · ' + s.setupName : '') + '</b>' +
-        '<p>' + (mode === 'long' ? '估值分位 · 质量 · 红利 · 反转 · 低波 · GARP（行业分位）' : '突破 · 压缩 · 涨停资金 · 执行质量（超跌独立池）') + '</p></div></div>' +
+        '<p>' + (mode === 'long' ? '估值分位 · 质量 · 红利 · 反转 · 低波 · GARP（行业分位）' : '流动性 · 波动约束 · 收益/成本比（短线排序唯一依据）') + '</p></div></div>' +
       '<div class="parts">' + parts + '</div>' +
-      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">分项为原始技术得分，综合分已按「形态 × 市场环境」校准，两者不必相加相等</p>' : '') +
+      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">下方分项为研究用综合分（未通过样本外验证，已退出推荐排序）；推荐依据 = 形态白名单 + 量比≥1.2 + J&lt;80，11 年实测有效</p>' : '') +
     '</div>' +
     sigBlock +
     setupBlock +
