@@ -1123,8 +1123,8 @@ function goldenDays(K, D) {
    · 主力资金流（fflow）接口当前不稳定/仅约 6 个月，拿不到时明确不使用，不编造。 */
 function scoreShort(x, ctx) {
   const I = x.ind, c = last(I.c);
-  const ma5 = last(I.ma5), ma20 = last(I.ma20), ma60 = last(I.ma60);
-  const K = last(I.K), D = last(I.D), J = last(I.J);
+  const ma5 = last(I.ma5), ma20 = last(I.ma20);
+  const J = last(I.J);
   const hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
   const r6 = last(I.r6), r5 = I.c.length > 6 ? c / I.c[I.c.length - 6] - 1 : 0;
   const atr = last(I.atr) || c * 0.03;
@@ -1144,8 +1144,6 @@ function scoreShort(x, ctx) {
   /* —— 分支判定（先定池，再算分；不同池的分数不可直接比较）—— */
   const oversoldCtx = marketDown && J < 20 && vr20 < 0.8 && isNum(ma5) && c > ma5 && I.ret20 < -0.05;
   const isBreakout = c >= hit20 * 0.995 && vr5 >= 1.2 && aboveMa20 && c >= (last(I.h) + last(I.l)) / 2;
-  const isSqueeze = I.bwRank <= 0.25 || (I.nr7 && I.atrRank <= 0.35);
-  const isLimit = I.limitStreak >= 1 || I.upLimit20 >= 2;
   const pool = oversoldCtx ? 'oversold' : 'main';
 
   const parts = [], reasons = [], risks = [];
@@ -1705,7 +1703,6 @@ async function runLongBacktest() {
   const N = idxBars.length;
   const minDate = idxBars[START] && idxBars[START].d, maxDate = idxBars[N - 1] && idxBars[N - 1].d;
 
-  const codes = list.map(x => x.code);
   /* 先给每只股票建日期 -> 在 bars 中的位置（应对个股停牌/上市时间差异）*/
   const datePos = {};
   for (const x of list) {
@@ -1721,7 +1718,6 @@ async function runLongBacktest() {
     /* 指数 bars 截断到当日 —— scoreLong 内部算 mktRet60 会读 state.indexes */
     state.indexes = { sh000001: { bars: idxBars.slice(0, i + 1) } };
 
-    const scored = [];
     const candidates = [];
     for (const x of list) {
       const j = datePos[x.code] && datePos[x.code][day];
@@ -1778,7 +1774,7 @@ async function runLongBacktest() {
       }
     }
 
-    let sum = 0, win = 0, n = 0;
+    let sum = 0, n = 0;
     for (const p of picks) {
       const bars = p.x.bars;
       const buy = bars[p.j + 1].o;
@@ -1803,7 +1799,7 @@ async function runLongBacktest() {
   const lanes = [[], [], [], []];
   tranches.forEach((t, k) => lanes[k % 4].push(t));
 
-  let best = -Infinity, worst = Infinity, peak = 100;
+  let peak = 100;
   const eqByLane = lanes.map(L => {
     let eq = 100, maxDd = 0;
     for (const t of L) {
@@ -1903,7 +1899,7 @@ function buildBacktestHTML() {
     const samples = bt ? bt.samples : 0;
     return { key: k, name: d.name, hold: d.hold, wr, avgRet, samples, bt };
   });
-  const good = rows.sort((a, b) => b.wr - a.wr);
+  rows.sort((a, b) => b.wr - a.wr);
 
   const hasBT = !!(S && Object.keys(S).some(k => S[k] && S[k].samples > 0));
   const costVal = isNum(state.btCost) ? state.btCost : 0.3;
@@ -2277,7 +2273,6 @@ function shortPlan(x, o) {
   o = o || {};
   const I = x.ind, c = last(I.c), atr = last(I.atr) || c * 0.03;
   const ma5 = last(I.ma5) || c;
-  const atrp = atr / c;
 
   /* 结构止损：2×ATR 与最近摆动低点取更近者，且不松于 -7% */
   const atrStop = c - 2 * atr;
@@ -2324,7 +2319,6 @@ function watchAdvice(x, meta) {
 
   const ma20 = last(I.ma20), ma60 = last(I.ma60), ma120 = last(I.ma120);
   const rsi = last(I.r6);   /* RSI(6)，analyze 输出的字段名是 r6 / r14 */
-  const kdjJ = I.J != null ? last(I.J) : null;
   const hist = last(I.hist);
   const prevHist = I.hist && I.hist.length >= 2 ? I.hist[I.hist.length - 2] : null;
 
@@ -2399,8 +2393,6 @@ function watchAdvice(x, meta) {
       cyqShape = ca.shape;
       cyqShapeName = ca.shapeName;
       const profitPct = ca.profitRatio * 100;
-      const concPct = ca.concentrated * 100;
-      const curVsCostPct = (ca.curPrice / ca.avgCost - 1) * 100;
       switch (ca.shape) {
         case 'bottom':
           score += 18; flags.push('底部密集峰'); break;
@@ -3049,9 +3041,6 @@ function analyzeMinute(minBars, dailyI) {
   const vwap = totalVol > 0 && totalAmt > 0 ? totalAmt / (totalVol * 100) : null;
   const vwapDiv = vwap != null && vwap > 0 ? closeN / vwap - 1 : 0;
   /* VWAP 斜率（最近 20 分钟）：线性回归 */
-  const tailN = Math.min(20, N);
-  const tailAmtArr = amt.slice(-tailN), tailVolArr = v.slice(-tailN);
-  const tailVWAP = (tailAmtArr.reduce((a, b) => a + (b || 0), 0) / (tailVolArr.reduce((a, b) => a + (b || 0), 0) * 100)) || 0;
   const vwapSlope = vwap != null ? (closeN / vwap - 1) * 100 : 0;  /* VWAP 偏离度（%） */
 
   /* 2. 早盘强弱：9:30~10:00 前 6 根 5分钟K线 */
@@ -3100,12 +3089,11 @@ function analyzeMinute(minBars, dailyI) {
 
   /* 7. 量价相关性（近 20 分钟）：量增价涨 → 正相关，量增价跌 → 负相关（顶背离） */
   const corrN = Math.min(20, N);
-  let xy = 0, x2 = 0, y2 = 0, upMoves = 0, downMoves = 0;
+  let xy = 0, x2 = 0, y2 = 0;
   for (let i = N - corrN + 1; i < N; i++) {
     const dp = c[i] - c[i - 1];
     const dv = v[i] - v[i - 1];
     xy += dp * dv; x2 += dp * dp; y2 += dv * dv;
-    if (dp > 0) upMoves++; else if (dp < 0) downMoves++;
   }
   const denom = Math.sqrt(x2 * y2);
   const priceVolCorr = denom > 0 ? xy / denom : 0;
@@ -3211,46 +3199,6 @@ function turnoverOf(x) {
     return estTurnoverRate(x.amount / 1e4, x.mcap);
   }
   return null;
-}
-
-/* 板块共振：同 sector 今日上涨的股票数 / sector 总数
-   衡量板块整体热度，分数越高说明板块共振强（A 股"板块效应"极强） */
-function sectorResonance(list, sector, date) {
-  if (!list || !list.length) return 0.5;
-  const same = list.filter(x => x.sector === sector);
-  if (!same.length) return 0.5;
-  let up = 0;
-  for (const x of same) {
-    if (!x.bars || !x.bars.length) continue;
-    const last = x.bars[x.bars.length - 1];
-    const prev = x.bars.length >= 2 ? x.bars[x.bars.length - 2] : last;
-    if (last && prev && last.c > prev.c) up++;
-  }
-  return up / same.length;
-}
-
-/* 精细量价背离检测（日线序列）：
-   价创 N 日新高但 OBV 未创新高 → 顶背离 → 减分
-   价创 N 日新低但 OBV 未创新低 → 底背离 → 加分
-   比 analyze() 里 volDiverge 更精细，能识别假突破 */
-function checkDivergence(I, N) {
-  N = N || 20;
-  const cArr = I.c.slice(-N);
-  const obvArr = I.obv.slice(-N);
-  const hi = Math.max(...cArr);
-  const lo = Math.min(...cArr);
-  const obvHi = Math.max(...obvArr);
-  const obvLo = Math.min(...obvArr);
-  const cur = last(I.c), curObv = last(I.obv);
-  /* 顶背离：价接近新高但 OBV 远低于新高 */
-  const nearHi = cur >= hi * 0.995;
-  const obvBelowHi = curObv < obvHi * 0.9;
-  const topDiverge = nearHi && obvBelowHi;
-  /* 底背离：价接近新低但 OBV 远高于新低 */
-  const nearLo = cur <= lo * 1.005;
-  const obvAboveLo = curObv > obvLo * 1.1;
-  const botDiverge = nearLo && obvAboveLo;
-  return { topDiverge, botDiverge };
 }
 
 /* 腾讯：日线备源 */
@@ -3420,12 +3368,6 @@ function auctionClistUrl(pn, pz) {
 }
 
 /* 集合竞价时段：9:15-9:30；9:25 为定格点 */
-function inAuction() {
-  const d = new Date();
-  if (d.getDay() === 0 || d.getDay() === 6) return false;
-  const hm = d.getHours() * 60 + d.getMinutes();
-  return hm >= 555 && hm < 570;
-}
 function auctionPhase() {
   const d = new Date();
   const hm = d.getHours() * 60 + d.getMinutes();
@@ -3614,8 +3556,6 @@ function limitUpEstimate(code, pct, vr, hist) {
     src,
   };
 }
-function limitUpProb(code, pct, vr, hist) { return limitUpEstimate(code, pct, vr, hist).p; }
-
 /* 竞价强势评分：涨幅/量比/成交额/市值 四维 + 技术面加分 */
 function scoreAuction(r) {
   const name = (r.f14 || '').replace(/\s+/g, '');
@@ -4255,8 +4195,8 @@ async function ensureWatchStock(code) {
       /* 与 scoreAll 同口径：量能类判断用最后一根已完成日线 */
       const idxBars = idx.bars.slice(0, completedEnd(idx.bars));
       const idxC = idxBars.map(b => b.c), idxV = idxBars.map(b => b.v || 0);
-      const idxMa20 = SMA(idxC, 20), idxMa60 = SMA(idxC, 60), idxVolMa20 = SMA(idxV, 20);
-      const lastC = idxC[idxC.length - 1], lastMa20 = idxMa20[idxMa20.length - 1], lastMa60 = idxMa60[idxMa60.length - 1];
+      const idxMa60 = SMA(idxC, 60), idxVolMa20 = SMA(idxV, 20);
+      const lastC = idxC[idxC.length - 1], lastMa60 = idxMa60[idxMa60.length - 1];
       const lastVolRatio = idxVolMa20 && idxVolMa20[idxVolMa20.length - 1] > 0 ? idxV[idxV.length - 1] / idxVolMa20[idxVolMa20.length - 1] : 1;
       /* marketUp 与主流程 marketTrendUp() 同一实现，避免自选股与列表口径错配 */
       ctx.marketUp = marketTrendUp();
@@ -5039,9 +4979,6 @@ function renderWatch() {
     /* —— verdict 徽章 —— */
     const toneMap = { strong: '#5CD66F', ok: '#8DD68D', mid: '#FFD166', warn: '#F59E0B', bad: '#EF4444' };
     const tone = adv ? (toneMap[adv.tone] || '#888') : '#888';
-    const verdictHTML = adv
-      ? '<span style="color:' + tone + ';font-weight:600;font-size:12px">' + adv.verdict + '</span>'
-      : '<span style="color:var(--dim);font-size:12px">—</span>';
 
     /* —— 建议行（卡片底部）—— */
     let adviceRow = '';
@@ -5218,7 +5155,6 @@ function renderAuction() {
   const head = $('#list');
   state.auctionView = true;
   const phase = auctionPhase();
-  const today = dayStr(new Date());
   const a = state.auction;
 
   /* 非交易日或非竞价时段提示 */
@@ -6275,13 +6211,11 @@ function drawCyq(cv, x) {
   const plotW = w - padL - padR;
 
   const Y = p => padT + (cyq.pHi - p) / (cyq.pHi - cyq.pLo) * plotH;
-  const X = frac => padL + frac * plotW;
 
   /* 找最大权重（归一化宽度）*/
   const maxW = Math.max(...cyq.weights, 1e-10);
 
   /* —— 1. 水平筹码条 —— */
-  const step = (cyq.pHi - cyq.pLo) / (cyq.prices.length - 1);
   const bandH = Math.max(plotH / cyq.prices.length - 1, 1.5);
   for (let j = 0; j < cyq.prices.length; j++) {
     const price = cyq.prices[j];
@@ -6391,10 +6325,6 @@ function cyqAdvice(x) {
   const curVsCost = (cur / avgCost - 1) * 100;       /* 现价相对平均成本偏离 */
   const curVsPeak = (cur / peakPrice - 1) * 100;     /* 现价相对峰位偏离 */
   const curInBand = cur >= p10 && cur <= p90;        /* 现价是否在 CYQ90 密集区 */
-  const peakNearLow = peakPrice <= (p10 + p90) / 2 * 0.98;  /* 峰是否偏下（低成本区）*/
-  const peakNearHigh = peakPrice >= (p10 + p90) / 2 * 1.02; /* 峰是否偏上（高成本区）*/
-  const costAbovePeak = avgCost > peakPrice * 1.02;   /* 平均成本高于峰位 → 有人被套 */
-  const costBelowPeak = avgCost < peakPrice * 0.98;   /* 平均成本低于峰位 → 有人获利 */
 
   const flags = [], risks = [];
   let shape = '', shapeName = '', shapeDesc = '';
