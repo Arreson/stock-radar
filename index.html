@@ -1635,8 +1635,8 @@ function runBacktest() {
   state.btSetupPf = setupPf;
   state.costSens = costAgg.map(c => c.n ? { cost: c.cost, n: c.n, wr3: Math.round(c.win / c.n * 100), avg3: +(c.sum / c.n * 100).toFixed(2) } : null).filter(Boolean);
   state.capSkipped = capSkipped;
-  /* ver=5：新增样本内外 / 逐年 / 形态贡献；旧缓存强制重算 */
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 5, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result, portfolio, split, yearly, setupPf, costSens: state.costSens, capSkipped })); } catch (e) {}
+  /* ver=6：日线深度 320→1200 根，旧回测（3 个月窗口）必须作废重算 */
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 6, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result, portfolio, split, yearly, setupPf, costSens: state.costSens, capSkipped })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1798,7 +1798,7 @@ function loadBacktest() {
     const raw = localStorage.getItem('qr_backtest');
     if (!raw) return false;
     const p = JSON.parse(raw);
-    if (p && p.ver === 5 && p.result && (Date.now() - p.ts) < 86400000) {
+    if (p && p.ver === 6 && p.result && (Date.now() - p.ts) < 86400000) {
       state.backtest = p.result;
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
