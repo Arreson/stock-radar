@@ -1994,7 +1994,14 @@ function buildBacktestHTML() {
     'style="width:64px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit">' +
     '<span class="dim">%（佣金 + 印花税 + 滑点），改完点「跑一次滚动回测」生效</span></div>';
 
-  const note = '<p><b>容量过滤</b>：假设单笔 20 万元、最多占 20 日均成交额 1%，剔除日均额 &lt; 2000 万元的信号（本次剔除 ' + (state.capSkipped || 0) + ' 个）。</p>' +
+  const spanY = state.btRange
+    ? (Date.parse(state.btRange[1]) - Date.parse(state.btRange[0])) / (365.25 * 864e5)
+    : 0;
+  const spanWarn = spanY > 0 && spanY < 2
+    ? '<p class="notice" style="font-size:11px;border-color:#ff9f43">⚠ 本次回测实际只覆盖 ' + spanY.toFixed(1) + ' 年，样本不足以支撑长期结论；请先完成一次含长历史数据的扫描。</p>'
+    : '';
+  const note = spanWarn + '<p><b>回测窗口</b>：' + (state.btRange ? state.btRange[0] + ' → ' + state.btRange[1] + '（约 ' + spanY.toFixed(1) + ' 年）' : '—') + '。指标需 260 根 K 线预热，预热期不计入信号。</p>' +
+    '<p><b>容量过滤</b>：假设单笔 20 万元、最多占 20 日均成交额 1%，剔除日均额 &lt; 2000 万元的信号（本次剔除 ' + (state.capSkipped || 0) + ' 个）。</p>' +
     '<p><b>回测说明</b>：T+1 下一日开盘买入。「固定持有」统计 2/3/5 日收盘卖出；「规则离场」为收盘跌破 3 日线或浮亏 7% 止损、最长持有 10 个交易日。每 5 个交易日采样一次信号，只用截至当日的 K 线，严格防止未来函数；牛熊状态按<b>日期</b>与上证 MA20 对齐。当前双边成本 ' + costTxt + '%。</p>' +
     '<p><b>真实胜率与硬编码基准的差异</b>：若某些形态真实胜率显著高于（或低于）基准值 <b>' + (hasBT ? '（点击下方按钮刷新可修正）' : '）') + '</b>，则意味着市场环境或标的覆盖已变化，以实时结果为准。</p>' +
     '<p><b>样本池偏差</b>：滚动回测只使用当前扫描入选的股票池（' + (state.backtestStocks || '—') + ' 只），并非全市场历史成分，存在选择/幸存者偏差；结论应理解为「该池内的历史表现」，不能直接外推为全市场容量。</p>';
@@ -2662,7 +2669,10 @@ function emSecid(code) {
 async function fetchEMBars(code, isIndex) {
   const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + emSecid(code) +
     '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57' +
-    '&klt=101&fqt=' + (isIndex ? '0' : '1') + '&lmt=420&end=20500101&ut=' + EM_UT;
+    /* lmt=1200（约 4.5 年）：回测需要真正的时间跨度。
+       原先 420 根 + 缓存只留 320 根，扣除 260 根指标预热后实际只剩约 3 个月，
+       根本不足以做年度/样本外检验。 */
+    '&klt=101&fqt=' + (isIndex ? '0' : '1') + '&lmt=1200&end=20500101&ut=' + EM_UT;
   const json = await emJSON(url, 9000);
   const kl = json && json.data && json.data.klines;
   if (!kl || !kl.length) throw new Error('东财无数据');
@@ -3752,7 +3762,7 @@ function showRetryBtn() {
   }
 }
 
-/* ---------------- 本地缓存（IndexedDB，容量足够存 240 只×320 根） ---------------- */
+/* ---------------- 本地缓存（IndexedDB，存 240 只×1200 根 ≈ 4.5 年） ---------------- */
 let __db = null;
 function openDB() {
   if (__db) return Promise.resolve(__db);
@@ -3782,17 +3792,17 @@ function dbGet(key) {
 
 function saveCache() {
   const pack = {
-    v: 5, ts: Date.now(), lastDate: state.lastDate,
+    v: 6, ts: Date.now(), lastDate: state.lastDate,
     marketTotal: state.marketTotal, coverN: state.coverN,
     meta: {}, data: {}, idx: {}
   };
   for (const k of Object.keys(state.data)) {
     const x = state.data[k];
     pack.meta[k] = { name: x.name, ind: x.sector };
-    pack.data[k] = { qt: x.qt, bars: x.bars.slice(-320) };
+    pack.data[k] = { qt: x.qt, bars: x.bars.slice(-1200) };
   }
   for (const k of Object.keys(state.indexes)) {
-    pack.idx[k] = { bars: state.indexes[k].bars.slice(-320) };
+    pack.idx[k] = { bars: state.indexes[k].bars.slice(-1200) };
   }
   dbPut('pack', pack).catch(() => {
     if (Object.keys(pack.data).length > 120) return;   /* 超量不写 localStorage */
@@ -3803,13 +3813,13 @@ function saveCache() {
 async function readCache() {
   try {
     const pack = await dbGet('pack');
-    if (pack && pack.v === 5 && pack.data) return pack;
+    if (pack && pack.v === 6 && pack.data) return pack;
   } catch (e) { /* 回落 localStorage */ }
   try {
     const raw = localStorage.getItem(STORE);
     if (!raw) return null;
     const pack = JSON.parse(raw);
-    if (!pack || pack.v !== 5 || !pack.data) return null;
+    if (!pack || pack.v !== 6 || !pack.data) return null;
     return pack;
   } catch (e) { return null; }
 }
