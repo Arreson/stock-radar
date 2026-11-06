@@ -1025,6 +1025,18 @@ function scoreShort(x, ctx) {
   const r6 = last(I.r6), r14 = last(I.r14);
   const hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
   const vr = last(I.vol5) > 0 ? last(I.v) / last(I.vol5) : 1;
+  /* —— 观察标签（仅展示：不计分、不过滤、不进白名单、不影响推荐）——
+     依据 500 只样本同口径回测（T+1 开盘买/双边 0.3%/3 日收盘卖）：
+     当日高开≥0.5% 且 量比(当日量/20日均量)≥1.5 → 3 日胜率 57.6%、均收 +1.66%（n=203）；
+     但样本外仅 44.4%/+0.53%（n=27），未达统计显著，因此只做标记，不进入推荐逻辑。 */
+  const obsTags = [];
+  const lastOpen = last(I.o), prevClose = I.c.length > 1 ? I.c[I.c.length - 2] : null;
+  const v20 = last(I.vol20);
+  const vr20 = isNum(v20) && v20 > 0 ? last(I.v) / v20 : 1;
+  if (isNum(lastOpen) && isNum(prevClose) && prevClose > 0) {
+    const gapPct = lastOpen / prevClose - 1;
+    if (gapPct >= 0.005 && vr20 >= 1.5) obsTags.push('观察·高开 ' + fmt(gapPct * 100, 1) + '% + 量比 ' + fmt(vr20, 1) + '倍');
+  }
   const hit20 = Math.max(...I.h.slice(-21, -1));
   const r5 = I.c.length > 6 ? c / I.c[I.c.length - 6] - 1 : 0;
   const r10 = I.c.length > 11 ? c / I.c[I.c.length - 11] - 1 : 0;
@@ -1266,7 +1278,7 @@ function scoreShort(x, ctx) {
   if (I.sealStrength != null && I.sealStrength < 0.5 && setup === 'breakout') risks.push('封板强度 ' + fmt(I.sealStrength * 100, 0) + '%，炸板较多');
 
   return {
-    score, parts, reasons: reasons.slice(0, 5), risks: risks.slice(0, 4),
+    score, parts, reasons: reasons.slice(0, 5), risks: risks.slice(0, 4), obsTags,
     setup, setupName: S.name, setupNote: S.note,
     winRate: si.wr, avgRet: si.avgRet, winRate3: si.wr3, avgRet3: si.avgRet3,
     hold: S.hold, samples: (state.backtest && state.backtest[setup] && state.backtest[setup].samples) || 0,
@@ -4344,6 +4356,10 @@ function cardHTML(x, mode, rank) {
       : (s.winRate ? ' · 胜率 ' + s.winRate + '%' : '')) +
     ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—');
   const footLong = '长线 ' + fmt(score, 1) + ' · 趋势与质量';
+  /* 观察标签：只展示，不计分、不过滤、不进推荐（与 reasons 严格分开，避免被当成入选理由） */
+  const obsMark = (m === 'short' && s.obsTags && s.obsTags.length)
+    ? s.obsTags.map(t => '<span class="chip" style="border-style:dashed;border-color:var(--muted);color:var(--muted);background:transparent" title="观察标签：仅展示，不计分/不过滤/不进推荐。500只样本同口径回测：3日胜率57.6%、均收+1.66%（n=203）；样本外44.4%/+0.53%（n=27），未达统计显著">' + t + '</span>').join('')
+    : '';
   return '<article class="card ' + m + (rank <= 3 ? ' top' : '') + '" data-code="' + x.code + '">' +
     '<div class="card-head">' +
       '<div class="ring"><svg viewBox="0 0 64 64"><circle class="rg" cx="32" cy="32" r="27"></circle>' +
@@ -4353,7 +4369,7 @@ function cardHTML(x, mode, rank) {
         '<div class="meta">' + x.sector + ' · ' + capTxt(x.mcap) + (m === 'short' && x.amount > 0 ? ' · ' + amtTxt(x.amount) : '') + trMark + '</div></div>' +
       '<div class="px"><b class="num">' + fmt(x.price) + '</b><small class="num ' + pctCls + '">' + signTxt(x.pct) + '</small></div>' +
     '</div>' +
-    '<div class="chips">' + reasons.map((r, i) => '<span class="chip ' + (i === 0 ? chipCls : '') + '">' + r + '</span>').join('') + (minute && minute.score && minute.score.notes ? minute.score.notes.slice(0, 2).map(n => '<span class="chip" style="border-color:var(--cyan);color:var(--cyan)">' + n + '</span>').join('') : '') + '</div>' +
+    '<div class="chips">' + reasons.map((r, i) => '<span class="chip ' + (i === 0 ? chipCls : '') + '">' + r + '</span>').join('') + obsMark + (minute && minute.score && minute.score.notes ? minute.score.notes.slice(0, 2).map(n => '<span class="chip" style="border-color:var(--cyan);color:var(--cyan)">' + n + '</span>').join('') : '') + '</div>' +
     '<canvas class="spark" data-code="' + x.code + '"></canvas>' +
     '<div class="card-foot"><span>' + (m === 'short' ? footShort : footLong) + '</span><span class="go">' + footExtra + ' 查看详情 ›</span></div>' +
     '</article>';
@@ -5479,6 +5495,11 @@ function renderDetail() {
     })() +
     '<div class="rr"><h4>入选理由</h4><div class="chips">' +
       s.reasons.map(r => '<span class="chip">' + r + '</span>').join('') + '</div></div>' +
+    (mode === 'short' && s.obsTags && s.obsTags.length
+      ? '<div class="rr"><h4>观察标签（仅展示，不进推荐）</h4><div class="chips">' +
+        s.obsTags.map(t => '<span class="chip" style="border-style:dashed;border-color:var(--muted);color:var(--muted);background:transparent">' + t + '</span>').join('') +
+        '</div><p style="font-size:11px;color:var(--muted);margin:6px 0 0;line-height:1.6">未计入评分、未参与过滤、未进入白名单与推荐。500 只样本同口径回测（T+1 开盘买/双边 0.3%/3 日卖）3 日胜率 57.6%、均收 +1.66%（n=203）；样本外 44.4%/+0.53%（n=27），未达统计显著，仅作观察。</p></div>'
+      : '') +
     '<div class="rr risks"><h4>风险提示</h4><div class="chips">' + risks + '</div></div>' +
     '<div class="rr"><h4>' + (mode === 'long' ? '中长期布局计划' : '短线交易计划') + '</h4>' +
       '<div class="plan">' + planRows + '</div></div>' +
