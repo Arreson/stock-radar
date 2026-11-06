@@ -4054,7 +4054,9 @@ function renderList() {
       if (!sk) return false;
       if (wl[sk] === false) return false;
       const prevHit = coolMap[x.code];
-      if (prevHit && prevHit >= cutoff) return false;
+      /* 同一交易日内重复渲染（刷新/量化快照回填）不应把当天已展示的信号冷却掉，
+         否则二次渲染会得到空列表；冷却从次日开始计算 */
+      if (prevHit && prevHit !== today && prevHit >= cutoff) return false;
       if (!(x.short.score >= 50)) return false;
       if (!volOK(x)) return false;
       const J = x.ind ? last(x.ind.J) : NaN;
@@ -4637,12 +4639,12 @@ function auctionStrip() {
     '<span style="color:var(--muted)"> · 竞价仅作情境标注，不参与过滤</span></div>';
 }
 
-/* 竞价页/短线页统一重绘入口：只影响当前「短线」页，其它页不打断 */
+/* 竞价页统一重绘入口：仅在竞价时段重绘竞价视图；
+   开盘后绝不在这里重绘短线列表（避免刷新时重置滚动位置、重复写入冷却记录） */
 function paintAuction() {
   if (state.tab !== 'short') return;
   if (state.search || state.ind !== '全部') return;
   if (showAuctionFirst()) renderAuction();
-  else renderList();
 }
 
 /* 测算引擎面板：展示实测触板率矩阵 + 昨日信号组合 */
