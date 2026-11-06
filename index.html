@@ -1432,6 +1432,10 @@ function runBacktest() {
   if (idxBars) idxBars.forEach((b, k) => idxPosByDate.set(b.d, k));
 
   const COST = clamp(isNum(state.btCost) ? state.btCost : 0.3, 0, 3) / 100;
+  /* 回测区间（YYYY-MM-DD，留空 = 全历史）：只统计区间内的信号，指标预热仍用区间前的 K 线 */
+  const FROM = (($('#btFrom') || {}).value || '').trim();
+  const TO = (($('#btTo') || {}).value || '').trim();
+  state.btFrom = FROM; state.btTo = TO;
   const STEP = 5;        /* 每 5 天采样一次 */
   const START = 260;     /* 信号起点：至少 260 根 bar 才能稳定计算 120/250 指标 */
   const HOLD_DAYS = [2, 3, 5];
@@ -1467,6 +1471,9 @@ function runBacktest() {
     let lastSig = -1e9;   /* 同票冷却：与实盘 renderList 一致，20 日内不重复计入 */
 
     for (let i = START; i <= N - 6; i += STEP) {
+      /* 区间过滤放在 analyze 之前：跳过区间外的交易日，省掉无用的全量指标计算 */
+      if (FROM && bars[i].d < FROM) continue;
+      if (TO && bars[i].d > TO) break;
       /* 只取 bar[0..i] 做 analyze，严格防止未来函数 */
       const win = bars.slice(0, i + 1);
       const I = analyze(win, x.code);
@@ -1610,6 +1617,17 @@ function runBacktest() {
     };
   }
   state.backtest = result;
+  /* 总体（全部形态合并）：用户问「胜率多少」时看这一行；原始计数保留，便于算 Wilson 区间 */
+  const A = Object.keys(SHORT_SETUP).reduce((a, k) => {
+    const o = agg[k];
+    a.n += o.count;
+    for (let h = 0; h < 3; h++) { a.win[h] += o.win[h]; a.sum[h] += o.sumRet[h]; }
+    return a;
+  }, { n: 0, win: [0, 0, 0], sum: [0, 0, 0] });
+  state.btOverall = A.n ? {
+    n: A.n, win: A.win,
+    avg: A.sum.map(s => +(s / A.n * 100).toFixed(2))
+  } : null;
   /* 按分数从低到高切 5 等份（样本不足 50 则不展示，避免小样本噪声被当成结论） */
   state.backtestScore = null;
   if (scoreSamples.length >= 50) {
@@ -1678,7 +1696,7 @@ function runBacktest() {
   state.costSens = costAgg.map(c => c.n ? { cost: c.cost, n: c.n, wr3: Math.round(c.win / c.n * 100), avg3: +(c.sum / c.n * 100).toFixed(2) } : null).filter(Boolean);
   state.capSkipped = capSkipped;
   /* ver=6：日线深度 320→1200 根，旧回测（3 个月窗口）必须作废重算 */
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 7, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result, portfolio, split, yearly, setupPf, costSens: state.costSens, capSkipped, score: state.backtestScore })); } catch (e) {}
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 8, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, from: FROM, to: TO, overall: state.btOverall, result, portfolio, split, yearly, setupPf, costSens: state.costSens, capSkipped, score: state.backtestScore })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1865,9 +1883,11 @@ function loadBacktest() {
     const raw = localStorage.getItem('qr_backtest');
     if (!raw) return false;
     const p = JSON.parse(raw);
-    if (p && p.ver === 7 && p.result && (Date.now() - p.ts) < 86400000) {
+    if (p && p.ver === 8 && p.result && (Date.now() - p.ts) < 86400000) {
       state.backtest = p.result;
       state.backtestScore = p.score || null;
+      state.btOverall = p.overall || null;
+      state.btFrom = p.from || ''; state.btTo = p.to || '';
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
       state.backtestSignals = p.signals;
@@ -2056,11 +2076,18 @@ function buildBacktestHTML() {
     }
   }
 
+  const inpSty = 'padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit';
   const cfg = '<div style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;flex-wrap:wrap">' +
     '<label for="btCost">双边成本</label>' +
     '<input id="btCost" type="number" min="0" max="3" step="0.05" value="' + costVal + '" ' +
-    'style="width:64px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit">' +
-    '<span class="dim">%（佣金 + 印花税 + 滑点），改完点「跑一次滚动回测」生效</span></div>';
+    'style="width:64px;' + inpSty + '">' +
+    '<span class="dim">%</span>' +
+    '<label for="btFrom" style="margin-left:8px">区间</label>' +
+    '<input id="btFrom" type="date" value="' + (state.btFrom || '') + '" style="width:130px;' + inpSty + '">' +
+    '<span class="dim">→</span>' +
+    '<input id="btTo" type="date" value="' + (state.btTo || '') + '" style="width:130px;' + inpSty + '">' +
+    '<button class="btn" id="bt2026Btn" style="flex:0 0 auto;padding:4px 8px;font-size:12px">仅 2026</button>' +
+    '<span class="dim">留空 = 全历史，改完点「跑一次滚动回测」生效</span></div>';
 
   const spanY = state.btRange
     ? (Date.parse(state.btRange[1]) - Date.parse(state.btRange[0])) / (365.25 * 864e5)
@@ -2093,7 +2120,25 @@ function buildBacktestHTML() {
       '<p class="dim" style="font-size:11px">判定：Q5 − Q1 的 5 日胜率差 <b>' + (dWr5 >= 0 ? '+' : '') + dWr5 + 'pp</b>、5 日均收差 <b>' + (dAvg5 >= 0 ? '+' : '') + dAvg5 + 'pp</b> → ' +
       (pass ? '<b style="color:var(--up)">通过（评分有正向区分力）</b>' : '<b style="color:var(--gold)">未通过（仅展示排序，不作为推荐依据）</b>') + '。样本 &lt;20 或未通过即不能当作选股优势。</p>';
   }
+  /* 总体胜率（全部形态合并）+ Wilson 95% 区间：回答「胜率到底多少」的唯一一行 */
+  let ovHTML = '';
+  const ov = state.btOverall;
+  if (ov && ov.n) {
+    const cell = h => {
+      const p = ov.win[h] / ov.n * 100;
+      const ci = wilsonCI(p, ov.n);   /* 既有的 wilsonCI 返回 [lo, hi]（百分数） */
+      return ci ? '<b>' + Math.round(p) + '%</b> <em style="font-size:10px;color:var(--muted)">' + Math.round(ci[0]) + '–' + Math.round(ci[1]) + '</em>' : '—';
+    };
+    ovHTML = '<h4>总体胜率（全部形态合并，扣成本后净收益 &gt; 0 记胜）</h4>' +
+      '<table class="bt"><thead><tr><th>区间</th><th>样本</th><th>2日胜率</th><th>3日胜率</th><th>3日均收</th><th>5日胜率</th><th>5日均收</th></tr></thead><tbody><tr>' +
+      '<td>' + rangeTxt + '</td><td>' + ov.n + '</td>' +
+      '<td>' + cell(0) + '</td><td>' + cell(1) + '</td><td>' + (ov.avg[1] >= 0 ? '+' : '') + ov.avg[1] + '%</td>' +
+      '<td>' + cell(2) + '</td><td>' + (ov.avg[2] >= 0 ? '+' : '') + ov.avg[2] + '%</td>' +
+      '</tr></tbody></table>' +
+      '<p class="dim" style="font-size:11px">括号内为 95% Wilson 区间。若区间下沿低于 50%，则「胜率优势」在统计上不成立。</p>';
+  }
   return '<section><h3>滚动回测引擎 <em>ROLLING BACKTEST</em> ' + summary + '</h3>' +
+    ovHTML +
     '<table class="bt">' +
     '<thead><tr><th>形态</th><th>5 日胜率</th><th>来源</th></tr></thead>' +
     '<tbody>' + rowsHTML + '</tbody>' +
@@ -5481,6 +5526,15 @@ function renderStrategy() {
       rb.textContent = r && r.ok ? '已完成 · ' + r.signals + ' 信号' : (r && r.reason ? r.reason : '失败');
       setTimeout(renderStrategy, 300);
     }, 30);   /* 放主线程让按钮先变文案 */
+  };
+  /* 区间快捷：一键锁定 2026 年 */
+  const b26 = $('#bt2026Btn');
+  if (b26) b26.onclick = () => {
+    const f = $('#btFrom'), t = $('#btTo');
+    if (f) f.value = '2026-01-01';
+    if (t) t.value = '2026-12-31';
+    state.btFrom = '2026-01-01';
+    state.btTo = '2026-12-31';
   };
   const cb = $('#clearBtBtn');
   if (cb) cb.onclick = () => {
