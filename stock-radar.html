@@ -1818,7 +1818,8 @@ function buildBacktestHTML() {
       '<td>' + pf.vol + '%</td><td>' + pf.mdd + '%</td>' +
       '<td>' + pf.sharpe + '</td><td>' + (pf.sortino || '—') + '</td><td>' + (pf.mdd === 0 ? '—' : pf.calmar) + '</td>' +
       '<td>' + (pf.corr == null ? '—' : pf.corr) + '</td></tr></tbody></table>' + spark +
-      '<p class="dim" style="font-size:11px;margin:2px 0 0">期末净值 ' + pf.finalEq + ' · 实际持仓 ' + pf.trades + ' 笔 / 因满仓跳过 ' + pf.skipped + ' 笔 · 交易集中度 HHI ' + pf.hhi + '、Top10 占比 ' + pf.top10 + '% · 共 ' + pf.days + ' 个交易日。等权合成、未再平衡。</p>';
+      '<p class="dim" style="font-size:11px;margin:2px 0 0">期末净值 ' + pf.finalEq + ' · 实际持仓 ' + pf.trades + ' 笔 / 因满仓跳过 ' + pf.skipped + ' 笔 · 交易集中度 HHI ' + pf.hhi + '、Top10 占比 ' + pf.top10 + '% · 共 ' + pf.days + ' 个交易日。等权合成、未再平衡。</p>' +
+      (pf.cagr < 0 ? '<p class="notice" style="margin:6px 0 0;font-size:11px;border-color:#ff5d5d">⚠ 组合层年化为负：全信号集（未含实盘的 score≥50 过滤）扣除成本后整体亏损。单笔胜率 50% 左右不等于可盈利，请以组合层为准。</p>' : '');
   } else if (hasBT) {
     pfHTML = '<h4>组合层表现</h4><p class="dim">样本不足，未生成组合曲线。</p>';
   }
