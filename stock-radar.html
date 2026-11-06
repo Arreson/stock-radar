@@ -1513,7 +1513,7 @@ function runBacktest() {
         if (r > 0) ca.win++;
       }
       /* 组合层路径：买入日扣买成本、卖出日扣卖成本 */
-      portTrades.push({ code: x.code,
+      portTrades.push({ code: x.code, setup: sk,
         path: [
           { d: bars[i + 1].d, r: c[i + 1] / buy - 1 - COST },
           { d: bars[i + 2].d, r: c[i + 2] / c[i + 1] - 1 },
@@ -1593,11 +1593,50 @@ function runBacktest() {
   state.btRange = minDate && maxDate ? [minDate, maxDate] : null;
   /* 组合层（等权 5 只 × 3 日）与成本敏感性 */
   const portfolio = simulatePortfolio(portTrades, idxBars);
+  /* —— 分布检验：样本内/外（规则冻结）、逐年、形态贡献 ——
+     ★ 样本外不重新调参、不重新挑白名单，只检验「同一套冻结规则」在后 30% 时间是否还成立；
+     否则就是又一次样本内过拟合。 */
+  const netOf = t => t.path.reduce((p, x) => p * (1 + x.r), 1) - 1;
+  let split = null;
+  if (idxBars && idxBars.length > 200 && portTrades.length >= 60) {
+    const k = Math.floor(idxBars.length * 0.7);
+    const cut = idxBars[k].d;
+    const isT = portTrades.filter(t => t.path[0].d < cut);
+    const osT = portTrades.filter(t => t.path[0].d >= cut);
+    const isPf = simulatePortfolio(isT, idxBars.slice(0, k + 1));
+    const osPf = simulatePortfolio(osT, idxBars.slice(k));
+    if (isPf && osPf) split = { cut, is: { n: isT.length, ...isPf }, oos: { n: osT.length, ...osPf } };
+  }
+  const yearMap = {};
+  portTrades.forEach(t => { const y = String(t.path[0].d).slice(0, 4); (yearMap[y] = yearMap[y] || []).push(t); });
+  const yearly = Object.keys(yearMap).sort().map(y => {
+    const ts = yearMap[y];
+    const rets = ts.map(netOf);
+    const p = ts.length >= 30 ? simulatePortfolio(ts, idxBars) : null;
+    return { y: y, n: ts.length,
+      win: Math.round(rets.filter(v => v > 0).length / ts.length * 100),
+      avg: +(rets.reduce((a, b) => a + b, 0) / ts.length * 100).toFixed(2),
+      total: p ? +((p.finalEq - 1) * 100).toFixed(1) : null,
+      mdd: p ? p.mdd : null };
+  });
+  const setupPf = Object.keys(SHORT_SETUP).map(k => {
+    const ts = portTrades.filter(t => t.setup === k);
+    if (ts.length < 30) return { key: k, name: SHORT_SETUP[k].name, n: ts.length, small: true };
+    const p = simulatePortfolio(ts, idxBars);
+    const rets = ts.map(netOf);
+    return { key: k, name: SHORT_SETUP[k].name, n: ts.length,
+      cagr: p ? p.cagr : null, mdd: p ? p.mdd : null,
+      wr: Math.round(rets.filter(v => v > 0).length / ts.length * 100),
+      avg: +(rets.reduce((a, b) => a + b, 0) / ts.length * 100).toFixed(2) };
+  }).sort((a, b) => (b.cagr == null ? -999 : b.cagr) - (a.cagr == null ? -999 : a.cagr));
   state.portfolioBt = portfolio;
+  state.btSplit = split;
+  state.btYearly = yearly;
+  state.btSetupPf = setupPf;
   state.costSens = costAgg.map(c => c.n ? { cost: c.cost, n: c.n, wr3: Math.round(c.win / c.n * 100), avg3: +(c.sum / c.n * 100).toFixed(2) } : null).filter(Boolean);
   state.capSkipped = capSkipped;
-  /* ver=4：新增组合层 + 成本敏感性 + 容量过滤；旧缓存口径不同，强制重算 */
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 4, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result, portfolio, costSens: state.costSens, capSkipped })); } catch (e) {}
+  /* ver=5：新增样本内外 / 逐年 / 形态贡献；旧缓存强制重算 */
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 5, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result, portfolio, split, yearly, setupPf, costSens: state.costSens, capSkipped })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1759,12 +1798,15 @@ function loadBacktest() {
     const raw = localStorage.getItem('qr_backtest');
     if (!raw) return false;
     const p = JSON.parse(raw);
-    if (p && p.ver === 4 && p.result && (Date.now() - p.ts) < 86400000) {
+    if (p && p.ver === 5 && p.result && (Date.now() - p.ts) < 86400000) {
       state.backtest = p.result;
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
       state.backtestSignals = p.signals;
       state.portfolioBt = p.portfolio || null;
+      state.btSplit = p.split || null;
+      state.btYearly = p.yearly || null;
+      state.btSetupPf = p.setupPf || null;
       state.costSens = p.costSens || null;
       state.capSkipped = p.capSkipped || 0;
       if (isNum(p.cost)) state.btCost = p.cost;
@@ -1822,6 +1864,43 @@ function buildBacktestHTML() {
       (pf.cagr < 0 ? '<p class="notice" style="margin:6px 0 0;font-size:11px;border-color:#ff5d5d">⚠ 组合层年化为负：全信号集（未含实盘的 score≥50 过滤）扣除成本后整体亏损。单笔胜率 50% 左右不等于可盈利，请以组合层为准。</p>' : '');
   } else if (hasBT) {
     pfHTML = '<h4>组合层表现</h4><p class="dim">样本不足，未生成组合曲线。</p>';
+  }
+
+  /* 样本内/样本外、逐年、形态贡献 —— 只做分布检验，不自动调参 */
+  const sp = state.btSplit;
+  let splitHTML = '';
+  if (sp) {
+    const srow = (label, d) => '<tr><td><b>' + label + '</b></td><td>' + d.n + '</td>' +
+      '<td><b class="' + (d.cagr >= 0 ? 'up' : 'down') + '">' + (d.cagr >= 0 ? '+' : '') + d.cagr + '%</b></td>' +
+      '<td>' + d.mdd + '%</td><td>' + d.sharpe + '</td></tr>';
+    splitHTML = '<h4>样本内 vs 样本外（规则冻结）</h4><table class="bt">' +
+      '<thead><tr><th>区间</th><th>交易</th><th>年化</th><th>最大回撤</th><th>Sharpe</th></tr></thead><tbody>' +
+      srow('样本内（<' + sp.cut + '）', sp.is) + srow('样本外（≥' + sp.cut + '）', sp.oos) + '</tbody></table>' +
+      '<p class="dim" style="font-size:11px;margin:2px 0 0">样本外不重新调参、不重挑白名单，直接沿用前 70% 时间定下的规则。样本外明显劣于样本内，通常意味着规则被拟合。</p>';
+  }
+  const yr = state.btYearly;
+  let yearHTML = '';
+  if (yr && yr.length) {
+    yearHTML = '<h4>逐年表现（当年信号等权合成）</h4><table class="bt">' +
+      '<thead><tr><th>年份</th><th>交易</th><th>3日胜率</th><th>单笔均收</th><th>合成收益</th><th>回撤</th></tr></thead><tbody>' +
+      yr.map(y => '<tr><td>' + y.y + '</td><td>' + y.n + '</td><td>' + y.win + '%</td>' +
+        '<td class="' + (y.avg >= 0 ? 'up' : 'down') + '">' + (y.avg >= 0 ? '+' : '') + y.avg + '%</td>' +
+        '<td>' + (y.total == null ? '—' : '<b class="' + (y.total >= 0 ? 'up' : 'down') + '">' + (y.total >= 0 ? '+' : '') + y.total + '%</b>') + '</td>' +
+        '<td>' + (y.mdd == null ? '—' : y.mdd + '%') + '</td></tr>').join('') +
+      '</tbody></table><p class="dim" style="font-size:11px;margin:2px 0 0">合成收益=该年信号按「等权 20%、最多 5 只」合成的期末净值变化（不满一年，不做年化）。</p>';
+  }
+  const su = state.btSetupPf;
+  let setupHTML = '';
+  if (su && su.length) {
+    setupHTML = '<h4>形态贡献（只做该形态的组合年化）</h4><table class="bt">' +
+      '<thead><tr><th>形态</th><th>交易</th><th>3日胜率</th><th>单笔均收</th><th>只做该形态年化</th><th>回撤</th></tr></thead><tbody>' +
+      su.map(s => s.small
+        ? '<tr><td>' + s.name + '</td><td>' + s.n + '</td><td colspan="4" class="dim">样本 <30，不评估</td></tr>'
+        : '<tr><td>' + s.name + '</td><td>' + s.n + '</td><td>' + s.wr + '%</td>' +
+          '<td class="' + (s.avg >= 0 ? 'up' : 'down') + '">' + (s.avg >= 0 ? '+' : '') + s.avg + '%</td>' +
+          '<td><b class="' + (s.cagr >= 0 ? 'up' : 'down') + '">' + (s.cagr >= 0 ? '+' : '') + s.cagr + '%</b></td>' +
+          '<td>' + s.mdd + '%</td></tr>').join('') +
+      '</tbody></table><p class="dim" style="font-size:11px;margin:2px 0 0">按形态单独合成（仍为等权 20%、最多 5 只、3 日持有）。负年化的形态是拖累项；这里只做诊断，不自动改白名单。</p>';
   }
 
   /* 成本敏感性 */
@@ -1930,7 +2009,7 @@ function buildBacktestHTML() {
     '<thead><tr><th>形态</th><th>5 日胜率</th><th>来源</th></tr></thead>' +
     '<tbody>' + rowsHTML + '</tbody>' +
     '</table>' +
-    pfHTML + costHTML + holdHTML + ruleHTML + tpHTML + cfg +
+    pfHTML + splitHTML + yearHTML + setupHTML + costHTML + holdHTML + ruleHTML + tpHTML + cfg +
     note + btn + '</section>';
 }
 
