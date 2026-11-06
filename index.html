@@ -801,23 +801,15 @@ function analyze(bars, code) {
     sealStrength = range > 0 ? (cl - lo) / range : 1.0;  /* 0~1，越接近 1 封板越死 */
   }
 
-  /* 向上缺口（今日有效 + 3 日内未回补 = gapTrend）
-     回补定义：3 日内 low <= 缺口起点（昨日 high） */
+  /* 向上缺口（今日有效且当日未回补 = gapTrend）
+     回补定义：当日 low <= 缺口起点（昨日 high）。只使用当日数据，避免未来函数；
+     历史回测按同一口径，故不再声称「3 日未回补」 */
   let gapUpToday = 0, gapUnfilled = false, gapTrend = 0;
-  if (gapUpArr.length > 0) {
+  if (gapUpArr.length > 0 && c.length >= 2) {
     gapUpToday = gapUpArr[gapUpArr.length - 1];
     if (gapUpToday > 0) {
-      /* 检查缺口是否是真的没回补：向后看 3 天内 low 是否回到 gap 起点 */
-      const gapStart = h[c.length - 2];  /* 缺口起点 = 昨日 high */
-      let unfilled = true;
-      const checkN = Math.min(3, c.length - 1 - (c.length - 1));
-      /* gap 在 i = c.length-1 处（即 today），所以看 today、today+1、today+2 的 low */
-      for (let k = 0; k < 3; k++) {
-        const idx = c.length - 1 + k;
-        if (idx >= l.length) break;
-        if (l[idx] <= gapStart) { unfilled = false; break; }
-      }
-      gapUnfilled = unfilled;
+      const gapStart = h[c.length - 2];
+      gapUnfilled = l[c.length - 1] > gapStart;
       gapTrend = gapUnfilled ? gapUpToday : 0;
     }
   }
@@ -908,6 +900,12 @@ function sectorStats(list) {
 }
 
 // 大盘趋势：上证指数 20 日均线斜率
+/* 最后一根已完成 K 线之后的位置：盘中的当日 bar 是半日数据，量能类判断必须剔除 */
+function completedEnd(bars) {
+  if (!bars || !bars.length) return 0;
+  return (marketOpen() && bars[bars.length - 1].d === shToday()) ? bars.length - 1 : bars.length;
+}
+
 function marketTrendUp() {
   const ix = state.indexes && state.indexes['sh000001'];
   if (!ix || !ix.bars || ix.bars.length < 60) return true;
@@ -1399,6 +1397,9 @@ function runBacktest() {
       /* T+1：下一日开盘买入，HOLD_DAYS 日收盘卖出；上限不越界 */
       const buy = i + 1 < N ? o[i + 1] : NaN;
       if (!isNum(buy) || buy <= 0) continue;
+      /* 成交可行性：次日一字涨停开盘（跳空 ≥ 涨停幅）时实盘买不到，剔除该信号，
+         否则回测会系统性地高估连板/缺口形态的收益 */
+      if (buy / c[i] - 1 >= limitUpPct(x.code) - 0.005) continue;
       let valid = true;
       for (let h = 0; h < HOLD_DAYS.length; h++) {
         if (i + 1 + HOLD_DAYS[h] >= N) { valid = false; break; }
@@ -1419,9 +1420,10 @@ function runBacktest() {
         if (ret > 0) rg.win[h]++;
       }
 
-      /* 规则离场：跌破 3 日线（由上方跌破才算，避免首日就误判），或自买入价回撤 7%，最长持有 RULE_MAX 日 */
+      /* 规则离场：跌破 3 日线（由上方跌破才算），或自买入价回撤 7%，最长持有 RULE_MAX 日。
+         ★ T+1：买入日（i+1）当天不能卖出，离场判定必须从 i+2 开始 */
       let exitIdx = Math.min(i + 1 + RULE_MAX, N - 1);
-      for (let k = i + 1; k <= Math.min(i + 1 + RULE_MAX, N - 1); k++) {
+      for (let k = i + 2; k <= Math.min(i + 1 + RULE_MAX, N - 1); k++) {
         const belowMa3 = k >= 3 && isNum(ma3[k]) && isNum(ma3[k - 1]) && c[k] < ma3[k] && c[k - 1] >= ma3[k - 1];
         if (belowMa3 || c[k] <= buy * (1 - RULE_STOP)) { exitIdx = k; break; }
       }
@@ -1438,7 +1440,8 @@ function runBacktest() {
       for (let t = 0; t < TP_LEVELS.length; t++) {
         const tp = TP_LEVELS[t];
         let tpRet = null;
-        for (let k = i + 1; k <= tpEnd; k++) {
+        /* T+1：买入日盘中不能卖出，止盈从 i+2 开始扫描 */
+        for (let k = i + 2; k <= tpEnd; k++) {
           if (bars[k].h >= buy * (1 + tp)) { tpRet = tp - COST; break; }
         }
         if (tpRet === null) tpRet = c[tpEnd] / buy - 1 - COST;
@@ -1487,8 +1490,8 @@ function runBacktest() {
   state.backtestStocks = list.length;
   state.backtestSignals = totalSignals;
   state.btRange = minDate && maxDate ? [minDate, maxDate] : null;
-  /* ver=2：回测口径加入白名单 + 同票冷却，旧缓存（ver 缺失）不再使用 */
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 2, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result })); } catch (e) {}
+  /* ver=3：T+1 离场修正 + 一字板不可成交过滤；旧缓存口径不同，强制重算 */
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 3, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1504,6 +1507,9 @@ function runLongBacktest() {
   const idx = state.indexes && state.indexes['sh000001'];
   const idxBars = idx && idx.bars ? idx.bars : null;
   if (!list.length || !idxBars) return { ok: false, reason: '暂无足够数据' };
+  /* 回测内会临时把 state.indexes 截断到历史某日（供 scoreLong 读大盘），
+     结束后必须还原，否则实盘的大盘/黄金窗口会一直使用被截断的指数序列 */
+  const idxBackup = state.indexes;
 
   const COST = clamp(isNum(state.btCost) ? state.btCost : 0.3, 0, 3) / 100;
   const TOPN = 10, HOLD = 60, STEP = 20, START = 260;
@@ -1574,6 +1580,7 @@ function runLongBacktest() {
     if (n) tranches.push({ d: day, r: sum / n, n });
   }
 
+  state.indexes = idxBackup;
   if (!tranches.length) return { ok: false, reason: '长期回测信号不足（至少需 80 天以上日线）' };
 
   /* 三条错开 lane（间隔 STEP 天，总持仓 = 3 × TOPN）*/
@@ -1646,7 +1653,7 @@ function loadBacktest() {
     const raw = localStorage.getItem('qr_backtest');
     if (!raw) return false;
     const p = JSON.parse(raw);
-    if (p && p.ver === 2 && p.result && (Date.now() - p.ts) < 86400000) {
+    if (p && p.ver === 3 && p.result && (Date.now() - p.ts) < 86400000) {
       state.backtest = p.result;
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
@@ -1684,7 +1691,7 @@ function buildBacktestHTML() {
     : '<em>尚未跑回测（首次扫描完成后可点击下面按钮运行）</em>';
 
   let rowsHTML = rows.map(r => {
-    const sampleInfo = r.bt ? '<span class="dim">· ' + r.samples + ' 样本</span>' : '<span class="dim">· 12 年基准</span>';
+    const sampleInfo = r.bt ? '<span class="dim">· ' + r.samples + ' 样本</span>' : '<span class="dim">· 历史基准</span>';
     const retInfo = r.avgRet != null ? ' · 均 ' + (r.avgRet >= 0 ? '+' : '') + fmt(r.avgRet, 2) + '%' : '';
     return '<tr>' +
       '<td><b>' + r.name + '</b><div class="dim" style="font-size:9px">' + DEFAULTS[r.key].hold + '</div></td>' +
@@ -1764,7 +1771,8 @@ function buildBacktestHTML() {
     '<span class="dim">%（佣金 + 印花税 + 滑点），改完点「跑一次滚动回测」生效</span></div>';
 
   const note = '<p><b>回测说明</b>：T+1 下一日开盘买入。「固定持有」统计 2/3/5 日收盘卖出；「规则离场」为收盘跌破 3 日线或浮亏 7% 止损、最长持有 10 个交易日。每 5 个交易日采样一次信号，只用截至当日的 K 线，严格防止未来函数；牛熊状态按<b>日期</b>与上证 MA20 对齐。当前双边成本 ' + costTxt + '%。</p>' +
-    '<p><b>真实胜率与硬编码基准的差异</b>：若某些形态真实胜率显著高于（或低于）基准值 <b>' + (hasBT ? '（点击下方按钮刷新可修正）' : '）') + '</b>，则意味着市场环境或标的覆盖已变化，以实时结果为准。</p>';
+    '<p><b>真实胜率与硬编码基准的差异</b>：若某些形态真实胜率显著高于（或低于）基准值 <b>' + (hasBT ? '（点击下方按钮刷新可修正）' : '）') + '</b>，则意味着市场环境或标的覆盖已变化，以实时结果为准。</p>' +
+    '<p><b>样本池偏差</b>：滚动回测只使用当前扫描入选的股票池（' + (state.backtestStocks || '—') + ' 只），并非全市场历史成分，存在选择/幸存者偏差；结论应理解为「该池内的历史表现」，不能直接外推为全市场容量。</p>';
 
   const btn = '<div style="display:flex;gap:10px;margin-top:10px">' +
     '<button class="btn" id="runBtBtn" style="flex:1">跑一次滚动回测</button>' +
@@ -1773,7 +1781,7 @@ function buildBacktestHTML() {
 
   return '<section><h3>滚动回测引擎 <em>ROLLING BACKTEST</em> ' + summary + '</h3>' +
     '<table class="bt">' +
-    '<thead><tr><th>形态</th><th>3 日胜率</th><th>来源</th></tr></thead>' +
+    '<thead><tr><th>形态</th><th>5 日胜率</th><th>来源</th></tr></thead>' +
     '<tbody>' + rowsHTML + '</tbody>' +
     '</table>' +
     holdHTML + ruleHTML + tpHTML + cfg +
@@ -1814,7 +1822,8 @@ function buildLongBacktestHTML() {
   }).join('');
   const year = '<h4>逐年表现（按建仓年份）</h4><table class="bt"><thead><tr><th>年份</th><th>交易数</th><th>胜率</th><th>每笔均收益</th></tr></thead><tbody>' + rows + '</tbody></table>';
 
-  const note = '<p><b>回测说明</b>：前 TOPN=' + B.topN + ' 名，持有 ' + B.hold + ' 个交易日，每 ' + B.step + ' 天调仓一次；双边成本 ' + B.cost + '%。组合层用 3 条错开 lane 模拟连续持仓（总持仓 = 3×TOPN）。<b>估值与行业排名全部中性化</b>——scoreLong 里 pe=20、pb=3、mcap=500、secRank=0.5，防未来函数。结果与实盘会有偏差（实盘用的是实时估值和行业排名）。</p>';
+  const note = '<p><b>回测说明</b>：前 TOPN=' + B.topN + ' 名，持有 ' + B.hold + ' 个交易日，每 ' + B.step + ' 天调仓一次；双边成本 ' + B.cost + '%。组合层用 3 条错开 lane 模拟连续持仓（总持仓 = 3×TOPN）。<b>估值与行业排名全部中性化</b>——scoreLong 里 pe=20、pb=3、mcap=500、secRank=0.5，防未来函数。结果与实盘会有偏差（实盘用的是实时估值和行业排名）。</p>' +
+    '<p><b>样本池偏差</b>：回测标的来自当前扫描入选的股票池，不是历史全市场成分，存在选择/幸存者偏差；年化与超额仅代表该池的历史表现。</p>';
 
   return '<section style="margin-top:8px"><h3>长期持有策略回测 <em>LONG HOLD · 60 DAYS</em> <em style="color:var(--muted);font-size:11px">' + (state.longBtTs ? new Date(state.longBtTs).toLocaleString('zh-CN', { hour12: false }) : '') + '</em></h3>' +
     sum + year + note + cfg + '</section>';
@@ -1908,12 +1917,12 @@ function nextDayForecast(x, ctx, setup) {
   return { prob: p, base, notes: notes.slice(0, 3) };
 }
 
-/* 海龟法则：1 单位仓位 = 账户风险预算 1% / (ATR / 价格) */
-function atrUnitPos(x, riskPct) {
-  const I = x.ind, c = last(I.c), atr = last(I.atr);
-  if (!isNum(atr) || atr <= 0 || c <= 0) return 0;
-  const unit = (riskPct || 1) / (atr / c);      /* 风险 1% 时，该股可承受的名义仓位% */
-  return Math.round(clamp(unit, 2, 25));
+/* 仓位 = 账户风险预算 ÷ 实际止损距离（1% 风险预算 + -5% 止损 → 20% 仓位）。
+   旧实现用 1×ATR 作为止损单位，但实际止损是 2×ATR / 结构位，等于是 2 倍风险预算，
+   这里统一按真实止损幅度计算 */
+function stopUnitPos(stopPct, riskPct) {
+  if (!isNum(stopPct) || stopPct <= 0) return 0;
+  return Math.round(clamp((riskPct || 1) / (stopPct / 100), 2, 25));
 }
 
 /* 半凯利：f = (W − (1−W)/R) / 2，W 胜率、R 盈亏比；负值归零 */
@@ -1934,13 +1943,14 @@ function longPlan(x) {
     ? Math.max(structStop, c * 0.75)
     : Math.min(ma120 * 0.97, c * 0.88);
   const stop = Math.max(stopRaw, c * 0.75);
-  const up = atrUnitPos(x, 1);
+  const stopPct = (1 - stop / c) * 100;
+  const up = stopUnitPos(stopPct, 1);
   return [
     ['建仓区间', fmt(lo) + ' – ' + fmt(hi)],
     ['加仓参考', '回踩 60 日线 ' + fmt(ma60) + '（分批，每批不超 1 单位）'],
     ['止损位', fmt(stop) + '（跌破' + (structStop && structStop < c ? '前低/结构位' : '年线') + '）'],
     ['持有周期', '6 – 18 个月'],
-    ['建议仓位', (up ? up : 20) + '%（按 1% 风险预算的 ATR 单位）'],
+    ['建议仓位', (up ? up : 20) + '%（1% 风险预算 / 止损 ' + fmt(stopPct, 1) + '%）'],
     ['跟踪信号', '周线 MACD 死叉离场']
   ];
 }
@@ -1960,13 +1970,14 @@ function shortPlan(x, o) {
   const setupKey = o.setup || 'trend';
   const setup = SHORT_SETUP[setupKey] || SHORT_SETUP.trend;
 
-  /* 仓位：ATR 单位（1% 风险）与半凯利取较小值；凯利为 0 表示负期望，只给 3% 试探仓 */
+  /* 仓位：按「实际止损距离」的 1% 风险单位与半凯利取较小值；
+     凯利为 0 表示负期望，只给 3% 试探仓 */
   const payoff = setupKey === 'resilient' ? 1.6 : setupKey === 'breakout' ? 1.5 : 1.2;
-  const atrUnit = atrUnitPos(x, 1) || 15;
+  const riskUnit = stopUnitPos(stopPct, 1) || 15;
   /* 静态基准只有 5 日口径；有浏览器回测时优先用 3 日池 */
   const realWr = btPool(setupKey, o.marketUp !== false) ? wrFor(setupKey, 3, o.marketUp !== false) : wrFor(setupKey, 5, o.marketUp !== false);
   const kelly = kellyPos(realWr, payoff);
-  let pos = Math.min(atrUnit, kelly > 0 ? kelly : 3);
+  let pos = Math.min(riskUnit, kelly > 0 ? kelly : 3);
   if (o.marketDown) pos = Math.round(Math.max(2, pos * 0.6));
   pos = Math.round(clamp(pos, 3, 20));
 
@@ -1976,7 +1987,7 @@ function shortPlan(x, o) {
     ['止损纪律', '收盘跌破 ' + fmt(stop) + '（约 -' + fmt(stopPct, 1) + '%）'],
     ['止盈方式', '回测最优：TP+8% 主动止盈（10 日内触及即卖）；未触及则跌破 3 日线离场'],
     ['时间止损', '3 个交易日不创新高即撤'],
-    ['建议仓位', pos + '%（ATR 单位 ' + atrUnit + '% · 半凯利 ' + kelly + '%' + (o.marketDown ? ' · 大盘下行×0.6' : '') + '）']
+    ['建议仓位', pos + '%（1%风险仓位 ' + riskUnit + '% · 半凯利 ' + kelly + '%' + (o.marketDown ? ' · 大盘下行×0.6' : '') + '）']
   ];
 }
 
@@ -2143,7 +2154,10 @@ function scoreAll() {
   /* 大盘黄金窗口/阴跌状态（主流程统一在此计算，与 ensureWatchStock 口径一致） */
   const _ix = state.indexes && state.indexes['sh000001'];
   if (_ix && _ix.bars && _ix.bars.length >= 260) {
-    const iC = _ix.bars.map(b => b.c), iV = _ix.bars.map(b => b.v || 0);
+    /* 黄金窗口/缩量阴跌是「收盘确认、次日生效」的统计信号，盘中必须用最后一根已完成日线，
+       否则半日成交量会让量比长期偏低，导致 bearGold 在盘中几乎永不触发 */
+    const end = completedEnd(_ix.bars);
+    const iC = _ix.bars.slice(0, end).map(b => b.c), iV = _ix.bars.slice(0, end).map(b => b.v || 0);
     const iMa60 = SMA(iC, 60), iVolMa20 = SMA(iV, 20);
     const li = iC.length - 1;
     const ivr = (iVolMa20[li] > 0) ? (iV[li] / iVolMa20[li]) : 1;
@@ -3074,11 +3088,14 @@ function scoreAuction(r) {
   else if (circ > 0 && circ < 30) { risks.push('小盘易操纵'); v -= 6; }
   else if (circ > 800) { risks.push('大盘难拉升'); v -= 6; }
 
-  /* 技术面加分：用昨日已缓存的日线数据 */
+  /* 技术面加分：用昨日已缓存的日线数据。
+     ★ 未缓存的票（不在当前 240 只深度池）无法计算技术面，若直接加 0 分，
+     会与已缓存票产生系统性偏差；这里按 16 分技术分的「中性值 8」计入，并在卡片标注 */
   const code = codeFromRow(r);
   const x = state.data[code];
+  const techKnown = !!(x && x.ind);
   let hist = null;
-  if (x && x.ind) {
+  if (techKnown) {
     const I = x.ind;
     /* analyze() 返回的是 ma20/K/D/r6/ret60，旧代码读 I.uptrend/I.rsi6/I.k/I.d
        全部为 undefined，技术面加分实际从未生效 —— 这里按真实字段重算 */
@@ -3103,6 +3120,8 @@ function scoreAuction(r) {
         else if (ret5 >= 15) { v += 3; reasons.push('5日动量强'); }
       }
     }
+  } else {
+    v += 8;   /* 技术面 16 分的中性替代 */
   }
 
   /* 买入建议 */
@@ -3117,7 +3136,7 @@ function scoreAuction(r) {
     price, pct, amtYi, volRatio, circ,
     score: clamp(Math.round(v), 0, 100),
     limitProb: limitUpProb(code, pct, isFinite(volRatio) ? volRatio : 1, hist),
-    reasons, risks,
+    reasons, risks, techKnown,
     buyLow, buyHigh, stop, target, pos,
     setup: '竞价强势'
   };
@@ -3643,15 +3662,23 @@ async function ensureWatchStock(code) {
   /* analyze + 评分 */
   try {
     x.ind = analyze(x.bars, x.code);
-    const ctx = { marketUp: true, secUp: {}, secRank: {}, indexes: state.indexes };
+    /* 横截面上下文：用当前扫描池，否则 buildContext 为空数组时相对强度/规模分位恒定，
+       自选股的评分会与主列表不可比 */
+    const pool = Object.values(state.data).filter(o => o && o.ind && o.bars && o.bars.length >= 260);
+    const baseCtx = buildContext(pool.length ? pool : [x]);
+    const sec = sectorStats(pool.length ? pool : [x]);
+    const ctx = Object.assign(baseCtx, { marketUp: true, secUp: sec.up, secRank: sec.rank, indexes: state.indexes });
     /* 大盘条件 */
     const idx = state.indexes && state.indexes['sh000001'];
     if (idx && idx.bars && idx.bars.length >= 260) {
-      const idxBars = idx.bars, idxC = idxBars.map(b => b.c), idxV = idxBars.map(b => b.v || 0);
+      /* 与 scoreAll 同口径：量能类判断用最后一根已完成日线 */
+      const idxBars = idx.bars.slice(0, completedEnd(idx.bars));
+      const idxC = idxBars.map(b => b.c), idxV = idxBars.map(b => b.v || 0);
       const idxMa20 = SMA(idxC, 20), idxMa60 = SMA(idxC, 60), idxVolMa20 = SMA(idxV, 20);
       const lastC = idxC[idxC.length - 1], lastMa20 = idxMa20[idxMa20.length - 1], lastMa60 = idxMa60[idxMa60.length - 1];
       const lastVolRatio = idxVolMa20 && idxVolMa20[idxVolMa20.length - 1] > 0 ? idxV[idxV.length - 1] / idxVolMa20[idxVolMa20.length - 1] : 1;
-      ctx.marketUp = lastC >= lastMa20;
+      /* marketUp 与主流程 marketTrendUp() 同一实现，避免自选股与列表口径错配 */
+      ctx.marketUp = marketTrendUp();
       /* 缩量阴跌过滤 + 放量反弹黄金信号：
          - 熊市（指数在 MA60 下方）但大盘成交量相对 20 日均 > 1.1 倍 = 放量反弹，回测 5 日胜率 53.2% / +0.77%
          - 连续下跌 ≥ 6 天 + 量比 < 0.6 = 缩量阴跌，这段时段 5 日均 -0.4%
@@ -4617,7 +4644,7 @@ function renderAuction() {
           '<span class="num">' + r.score + '</span></div>' +
         '<div class="ci"><div class="nm">' + r.name + '<span class="cd">' + r.code.slice(2) + '</span>' +
           (i === 0 ? '<em class="badge">首选</em>' : '') + '</div>' +
-          '<div class="meta">' + r.ind + ' · 流通 ' + (r.circ ? r.circ.toFixed(0) + '亿' : '—') + '</div></div>' +
+          '<div class="meta">' + r.ind + ' · 流通 ' + (r.circ ? r.circ.toFixed(0) + '亿' : '—') + (r.techKnown === false ? ' · 技术面未计(中性)' : '') + '</div></div>' +
         '<div class="px"><b class="num ' + pctCls + '">' + fmt(r.price) + '</b>' +
           '<small class="num ' + pctCls + '">' + signTxt(r.pct) + '</small></div>' +
       '</div>' +
