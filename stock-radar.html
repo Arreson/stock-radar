@@ -515,6 +515,10 @@ const state = {
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const last = a => a[a.length - 1];
 const isNum = v => typeof v === 'number' && isFinite(v);
+/* 涨跌停幅度：创业板 300/301、科创板 688/689 为 20%，主板 10%
+   之前统一按 9.5% 判定，会把 20cm 标的 +10% 误算成涨停，污染连板/触板统计 */
+const isTwentyBoard = code => /^(sz30|sh68)/.test(String(code || ''));
+const limitUpPct = code => isTwentyBoard(code) ? 0.20 : 0.10;
 const fmt = (n, d = 2) => isNum(n) ? n.toFixed(d) : '—';
 /* 金额格式：≥1 万显示"x.xx 万"，否则整数千分位 */
 const fmtMoney = n => {
@@ -710,7 +714,7 @@ function swings(bars, n = 3) {
   return { hi, lo };
 }
 
-function analyze(bars) {
+function analyze(bars, code) {
   const o = bars.map(b => b.o), c = bars.map(b => b.c);
   const h = bars.map(b => b.h), l = bars.map(b => b.l), v = bars.map(b => b.v);
   const ma5 = SMA(c, 5), ma10 = SMA(c, 10), ma20 = SMA(c, 20);
@@ -754,16 +758,15 @@ function analyze(bars) {
   const volDiverge = pNewHi && !obvNewHi;   /* 价创新高而 OBV 未创新高 → 量价顶背离 */
 
   /* ============= A 股日线独有因子 ============= */
-  /* 涨停识别：涨幅 ≥ 9.5% 且收在最高（主板近似；创业板/科创板 ≥ 19.5% 会被一并捕获）
-     更精确做法：前收*1.1/1.2/1.3/0.95 但我们没有板块信息，统一用涨跌幅+收最高近似 */
+  /* 涨停识别：按板块涨跌停幅度判定（主板 10% / 创业板·科创板 20%），且收在最高 */
   const upLimitArr = [], downLimitArr = [];
   const gapUpArr = [];     /* 向上缺口序列，记录缺口幅度 */
   const atrPctArr = [];    /* ATR/close 历史序列（用于波动率聚集分位） */
-  const limitThresh = 0.095;
+  const limitThresh = limitUpPct(code) - 0.005;
   for (let i = 1; i < c.length; i++) {
     const pct = (c[i] - c[i - 1]) / c[i - 1];
-    upLimitArr.push(pct >= 0.095 && closeEqHigh(c[i], h[i]));
-    downLimitArr.push(pct <= -0.095 && closeEqLow(c[i], l[i]));
+    upLimitArr.push(pct >= limitThresh && closeEqHigh(c[i], h[i]));
+    downLimitArr.push(pct <= -limitThresh && closeEqLow(c[i], l[i]));
     /* 向上缺口：今日 open > 昨日 high * 1.015 算有效跳空 */
     if (bars[i] && bars[i].o && h[i - 1] > 0) {
       gapUpArr.push(bars[i].o > h[i - 1] * 1.015 ? (bars[i].o - h[i - 1]) / h[i - 1] : 0);
@@ -909,25 +912,14 @@ function marketTrendUp() {
   const ix = state.indexes && state.indexes['sh000001'];
   if (!ix || !ix.bars || ix.bars.length < 60) return true;
   const c = ix.bars.map(b => b.c);
-  const ma20 = SMA(c, 20), ma60 = SMA(c, 60);
+  const ma20 = SMA(c, 20);
   const n20 = ma20.length;
   if (n20 < 11) return true;
   const lastC = c[c.length - 1];
   const lastMa20 = ma20[n20 - 1];
-  const lastMa60 = ma60[ma60.length - 1];
-  /* 条件组合：至少满足两个视为下行 */
-  let bear = 0;
-  // 1. MA20 最近 10 根斜率为负
-  const recent = ma20.slice(-10);
-  const xm = (recent.length - 1) / 2, ym = recent.reduce((a, b) => a + b, 0) / recent.length;
-  let num = 0, den = 0;
-  recent.forEach((v, i) => { num += (i - xm) * (v - ym); den += (i - xm) ** 2; });
-  if (den && num / den < 0) bear++;
-  // 2. 现价在 MA60 下方
-  if (lastC < lastMa60) bear++;
-  // 3. MA20 < MA60（死叉结构）
-  if (lastMa20 < lastMa60) bear++;
-  return bear < 2;
+  /* 口径必须与回测 bull20 一致（回测用“上证收盘 ≥ MA20”划分牛/熊池），
+     否则实盘会按 A 口径选形态、却引用 B 口径的胜率，卡片的胜率参考会错配 */
+  return lastC >= lastMa20;
 }
 
 function scoreLong(x, ctx) {
@@ -1124,8 +1116,8 @@ function scoreShort(x, ctx) {
   else if (I.gapUpToday > 0) v += 2;         /* 向上缺口但已回补 */
   if (I.upLimit20 >= 3 && I.limitStreak === 0) v += 4;  /* 多日涨停但没连板=板块热度 */
   if (I.volRatioRank >= 0.7) v += 3;          /* 量比偏高（但已在安全区间） */
-  /* 换手率粗估 + 板块共振（日线替代因子：解决缺分钟级数据） */
-  const estTR = x.mcap && x.amount && x.amount > 0 ? (x.amount / (x.mcap * 1e8) / 0.5 * 100) : null;
+  /* 换手率 + 板块共振（日线替代因子：解决缺分钟级数据） */
+  const estTR = turnoverOf(x);
   if (estTR != null) {
     if (estTR >= 2 && estTR <= 8) v += 3;      /* 温和换手 2-8% */
     else if (estTR > 8) v += 1;                 /* 高换手（博弈） */
@@ -1197,9 +1189,8 @@ function scoreShort(x, ctx) {
      其余非逆势但技术形态尚可的标的，给予 0.55 系数、上限 58，避免分数集体归零 */
   let rawFinal = raw;
 
-  /* ★ bearGold / bearTight 分数调整（必须在 score 计算之前）——
-     熊市放量反弹黄金窗口 +5 分；缩量阴跌 -4 分 */
-  if (ctx.bearGold) { rawFinal += 5; }
+  /* bearTight 缩量阴跌降权（在 score 计算之前）；
+     bearGold 的 +5 统一放在形态校准之后（只加一次，避免重复计分） */
   if (ctx.bearTight) { rawFinal -= 4; }
 
   let score = marketDown
@@ -1226,8 +1217,6 @@ function scoreShort(x, ctx) {
     else if (setup === 'gap') score = Math.max(score, 50);     /* 熊市向上缺口 */
     else if (setup === 'kdj') score = Math.max(score, 50);
     else if (setup === 'breakout') score = Math.min(score, 30); /* 熊市追高被套，封顶 30 */
-    /* bearGold 时段再加 5 分黄金窗口加分 */
-    if (ctx.bearGold) score = Math.min(100, score + 5);
   } else {
     /* 牛市：breakout/trend/limitup/gap 是正期望 */
     if (setup === 'limitup') score = Math.max(score, 55);       /* 牛市连板效应最强 */
@@ -1240,6 +1229,8 @@ function scoreShort(x, ctx) {
     else if (setup === 'weak') score = Math.min(score, 32);
   }
   score = clamp(score, 0, 100);
+  /* bearGold 黄金窗口 +5（只加一次；与市场分类无关，只要指数在 MA60 下方即可成立） */
+  if (ctx.bearGold) score = clamp(score + 5, 0, 100);
 
   const reasons = [];
   if (ctx.bearGold) reasons.push('🔥放量反弹·黄金窗口');
@@ -1379,12 +1370,14 @@ function runBacktest() {
     if (N < START + 6) continue;
     const c = bars.map(b => b.c), o = bars.map(b => b.o);
     const ma3 = SMA(c, 3);
+    let lastSig = -1e9;   /* 同票冷却：与实盘 renderList 一致，20 日内不重复计入 */
 
     for (let i = START; i <= N - 6; i += STEP) {
       /* 只取 bar[0..i] 做 analyze，严格防止未来函数 */
       const win = bars.slice(0, i + 1);
-      const I = analyze(win);
-      /* ★ 与实盘同口径的量价确认（量比≥1.2 且 J<80），否则卡片胜率会虚高于实盘筛选后的真实表现 */
+      const I = analyze(win, x.code);
+      /* ★ 与实盘同口径：量比≥1.2 + J<80 + 自适应白名单 + 同票 20 日冷却
+         （score≥50 门槛未复算，因为历史横截面成交额不可得；静态胜率表已包含该门槛） */
       const v20b = I.vol20[I.vol20.length - 1];
       const vrB = isNum(v20b) && v20b > 0 ? last(I.v) / v20b : 1;
       const Jb = last(I.J);
@@ -1399,6 +1392,9 @@ function runBacktest() {
       const sk = classifySetup(I, x, { marketUp: bull20 });
       const op = agg[sk];
       if (!op) continue;
+      /* 白名单（按该历史日的市场状态）+ 20 日冷却，口径与实盘一致 */
+      if (shortWhitelistFor(bull20)[sk] === false) continue;
+      if (i - lastSig < SHORT_COOLDOWN_DAYS) continue;
 
       /* T+1：下一日开盘买入，HOLD_DAYS 日收盘卖出；上限不越界 */
       const buy = i + 1 < N ? o[i + 1] : NaN;
@@ -1409,6 +1405,7 @@ function runBacktest() {
       }
       if (!valid) continue;
 
+      lastSig = i;
       op.count++;
       totalSignals++;
       const rg = bull20 ? op.reg.bull : op.reg.bear;
@@ -1490,7 +1487,8 @@ function runBacktest() {
   state.backtestStocks = list.length;
   state.backtestSignals = totalSignals;
   state.btRange = minDate && maxDate ? [minDate, maxDate] : null;
-  try { localStorage.setItem('qr_backtest', JSON.stringify({ ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result })); } catch (e) {}
+  /* ver=2：回测口径加入白名单 + 同票冷却，旧缓存（ver 缺失）不再使用 */
+  try { localStorage.setItem('qr_backtest', JSON.stringify({ ver: 2, ts: state.backtestTs, stocks: state.backtestStocks, signals: totalSignals, cost: state.btCost, range: state.btRange, result })); } catch (e) {}
   return { ok: true, stocks: list.length, signals: totalSignals, result };
 }
 
@@ -1542,7 +1540,7 @@ function runLongBacktest() {
     const ctx = { ret60: [], ret120: [], r2: [], mdd: [], vol: [], secRank: {}, secUp: {} };
     for (const c of candidates) {
       const bars = c.x.bars.slice(0, c.j + 1);
-      const I = analyze(bars);
+      const I = analyze(bars, c.x.code);
       c.I = I;
       ctx.ret60.push(I.ret60);
       ctx.ret120.push(I.ret120);
@@ -1648,7 +1646,7 @@ function loadBacktest() {
     const raw = localStorage.getItem('qr_backtest');
     if (!raw) return false;
     const p = JSON.parse(raw);
-    if (p && p.result && (Date.now() - p.ts) < 86400000) {
+    if (p && p.ver === 2 && p.result && (Date.now() - p.ts) < 86400000) {
       state.backtest = p.result;
       state.backtestTs = p.ts;
       state.backtestStocks = p.stocks;
@@ -1667,7 +1665,7 @@ function buildBacktestHTML() {
   const S = state.backtest;
   const DEFAULTS = SHORT_SETUP;
   const rows = Object.keys(DEFAULTS).map(k => {
-    const bt = S && S[k] && S[k].samples >= 5 ? S[k] : null;
+    const bt = S && S[k] && S[k].samples >= 30 ? S[k] : null;   /* <30 样本不展示，避免噪声 */
     const d = DEFAULTS[k];
     /* wr：浏览器回测（当前市场池）优先；未回测则回落 12 年实测基准（均为 5 日口径） */
     const wr = wrFor(k, 5, state.marketUp);
@@ -1700,11 +1698,12 @@ function buildBacktestHTML() {
   if (hasBT) {
     holdHTML = '<h4>不同持有周期胜率对比</h4>' +
       '<table class="bt">' +
-      '<thead><tr><th>形态</th><th>2 日</th><th>3 日</th><th>5 日</th><th>3日均收益</th></tr></thead>' +
+      '<thead><tr><th>形态</th><th>样本</th><th>2 日</th><th>3 日</th><th>5 日</th><th>3日均收益</th></tr></thead>' +
       rows.map(r => {
         const bt = S[r.key];
-        if (!bt || bt.samples < 5) return '';
+        if (!bt || bt.samples < 30) return '';   /* <30 样本噪声过大，不展示 */
         return '<tr><td>' + r.name + '</td>' +
+          '<td>' + bt.samples + '</td>' +
           '<td>' + bt.wr2 + '%</td>' +
           '<td><b>' + bt.wr3 + '%</b></td>' +
           '<td>' + bt.wr5 + '%</td>' +
@@ -1716,7 +1715,7 @@ function buildBacktestHTML() {
   /* 规则离场 vs 固定持有：两种口径直接对比 */
   let ruleHTML = '';
   if (hasBT) {
-    const okRows = rows.filter(r => S[r.key] && S[r.key].ruleSamples >= 5);
+    const okRows = rows.filter(r => S[r.key] && S[r.key].ruleSamples >= 30);
     if (okRows.length) {
       ruleHTML = '<h4>规则离场 vs 固定持有（3 日）</h4>' +
         '<table class="bt">' +
@@ -1737,7 +1736,7 @@ function buildBacktestHTML() {
   /* 主动止盈对照：盘中触及 +5%/+8% 即卖，最长 10 日（路线A回测产物） */
   let tpHTML = '';
   if (hasBT) {
-    const tpRows = rows.filter(r => S[r.key] && S[r.key].tpN >= 5);
+    const tpRows = rows.filter(r => S[r.key] && S[r.key].tpN >= 30);
     if (tpRows.length) {
       const fp = v => (v >= 0 ? '+' : '') + v + '%';
       tpHTML = '<h4>主动止盈对照（盘中触及即卖 · 最长 10 日）</h4>' +
@@ -1825,9 +1824,10 @@ function buildLongBacktestHTML() {
 const HOLD_IDX = h => (h === 2 ? 0 : h === 3 ? 1 : 2);
 function btPool(setup, marketUp) {
   const bt = state.backtest && state.backtest[setup];
-  if (!bt || bt.samples < 5) return null;
+  /* 30 样本门槛：低于 30 的胜率波动极大（±10pp 以上），不用于展示 */
+  if (!bt || bt.samples < 30) return null;
   const r = bt.reg && (marketUp === false ? bt.reg.bear : bt.reg.bull);
-  if (r && r.n >= 5) return r;
+  if (r && r.n >= 30) return r;
   return { n: bt.samples, wr: [bt.wr2, bt.wr3, bt.wr5], avg: [bt.avgRet2, bt.avgRet3, bt.avgRet5] };
 }
 function wrFor(setup, holdDays, marketUp) {
@@ -1853,8 +1853,10 @@ function setupInfoForShort(x, ctx) {
     (!ctx.secUp || !x.sector || ctx.secUp[x.sector] !== false);
   const wr = wrFor(setup, 5, ctx.marketUp);
   const avgRet = avgRetFor(setup, 5, ctx.marketUp);
-  const wr3 = wrFor(setup, 3, ctx.marketUp);
-  const avgRet3 = avgRetFor(setup, 3, ctx.marketUp);
+  /* 静态基准表只有 5 日口径；没有浏览器回测时不要把 5 日数字伪装成 3 日 */
+  const hasBT = !!btPool(setup, ctx.marketUp);
+  const wr3 = hasBT ? wrFor(setup, 3, ctx.marketUp) : null;
+  const avgRet3 = hasBT ? avgRetFor(setup, 3, ctx.marketUp) : null;
   const S = SHORT_SETUP[setup] || SHORT_SETUP.weak;
   return { setup, setupName: S.name, setupNote: S.note, wr, avgRet, wr3, avgRet3, hold: S.hold, resilient };
 }
@@ -1898,8 +1900,8 @@ function nextDayForecast(x, ctx, setup) {
   const vr = last(I.vol5) > 0 ? last(I.v) / last(I.vol5) : 1;
   if (setup === 'kdj' && ctx.marketUp === false && vr >= 1.5) { p -= 10.4; notes.push('放量拐点多为假信号 -10pp'); }
   else if (setup === 'bounce' && ctx.marketUp === false && vr >= 1.5) { p += 3.8; notes.push('放量超卖确认 +4pp'); }
-  /* 连板效应 */
-  if (I.limitStreak >= 1) { p += 7.0; notes.push('连板动量 +7pp'); }
+  /* 连板效应：limitup 形态的基准概率本身已来自连板样本，不能再叠加 */
+  if (I.limitStreak >= 1 && setup !== 'limitup') { p += 7.0; notes.push('连板动量 +7pp'); }
   /* 跌停预警 */
   if (I.downLimit20 >= 2) { p -= 4.0; notes.push('近期跌停 -4pp'); }
   p = Math.round(Math.min(66, Math.max(35, p)) * 10) / 10;
@@ -1926,11 +1928,12 @@ function longPlan(x) {
   const I = x.ind, c = last(I.c), atr = last(I.atr) || c * 0.03;
   const ma20 = last(I.ma20) || c, ma60 = last(I.ma60) || c, ma120 = last(I.ma120) || c;
   const lo = Math.min(c, ma20) * 0.97, hi = Math.max(c, ma20) * 1.02;
-  /* 结构止损：优先用最近确认摆动低点，其次年线 */
+  /* 结构止损：优先用最近确认摆动低点，其次年线；统一限制最大止损距离 -25% */
   const structStop = isNum(I.swingLow) ? I.swingLow - 0.5 * atr : null;
-  const stop = structStop && structStop < c
+  const stopRaw = structStop && structStop < c
     ? Math.max(structStop, c * 0.75)
     : Math.min(ma120 * 0.97, c * 0.88);
+  const stop = Math.max(stopRaw, c * 0.75);
   const up = atrUnitPos(x, 1);
   return [
     ['建仓区间', fmt(lo) + ' – ' + fmt(hi)],
@@ -1960,7 +1963,8 @@ function shortPlan(x, o) {
   /* 仓位：ATR 单位（1% 风险）与半凯利取较小值；凯利为 0 表示负期望，只给 3% 试探仓 */
   const payoff = setupKey === 'resilient' ? 1.6 : setupKey === 'breakout' ? 1.5 : 1.2;
   const atrUnit = atrUnitPos(x, 1) || 15;
-  const realWr = wrFor(setupKey, 3, o.marketUp !== false);
+  /* 静态基准只有 5 日口径；有浏览器回测时优先用 3 日池 */
+  const realWr = btPool(setupKey, o.marketUp !== false) ? wrFor(setupKey, 3, o.marketUp !== false) : wrFor(setupKey, 5, o.marketUp !== false);
   const kelly = kellyPos(realWr, payoff);
   let pos = Math.min(atrUnit, kelly > 0 ? kelly : 3);
   if (o.marketDown) pos = Math.round(Math.max(2, pos * 0.6));
@@ -2216,7 +2220,7 @@ function buildEntry(meta, raw) {
     bars, qt: raw.qt || [],
     lastDate: last(bars).d
   };
-  x.ind = analyze(bars);
+  x.ind = analyze(bars, meta.code);
   parseQt(x);
   x.hi52 = Math.max(...bars.slice(-250).map(b => b.h));
   x.lo52 = Math.min(...bars.slice(-250).map(b => b.l));
@@ -2559,7 +2563,7 @@ function analyzeMinute(minBars, dailyI) {
   };
 }
 
-/* 分钟级日内信号评分（叠加到 scoreShort，实盘专用） */
+/* 分钟级日内信号评分（仅作日内状态展示，不参与 scoreShort 排序——日线口径不受影响） */
 function scoreMinute(minInd, dailyI) {
   if (!minInd) return null;
   let v = 0, note = [];
@@ -2630,6 +2634,18 @@ function estTurnoverRate(amtYi, mcap) {
   /* amtYi 亿元，mcap 亿元 → 流通市值估 30-70%，取 50% 做粗略 */
   const floatMcap = mcap * 0.5;
   return amtYi / floatMcap * 100;  /* 近似换手率 % */
+}
+
+/* 统一换手率口径：优先用腾讯实时换手率 f38；缺失时用成交额粗估。
+   注意单位：x.amount = 万元（腾讯 f37）、x.mcap = 亿元（腾讯 f45），
+   必须先换算成同单位，否则会得到 0.001% 量级（旧代码的错误） */
+function turnoverOf(x) {
+  if (!x) return null;
+  if (isNum(x.turnover) && x.turnover > 0) return x.turnover;
+  if (isNum(x.amount) && x.amount > 0 && isNum(x.mcap) && x.mcap > 0) {
+    return estTurnoverRate(x.amount / 1e4, x.mcap);
+  }
+  return null;
 }
 
 /* 板块共振：同 sector 今日上涨的股票数 / sector 总数
@@ -2804,7 +2820,7 @@ function applyQuote(x, f) {
   parseQt(x);
   if (!changed) return true;
   x.lastDate = last(bars).d;
-  x.ind = analyze(bars);
+  x.ind = analyze(bars, x.code);
   x.hi52 = Math.max(...bars.slice(-250).map(b => b.h));
   x.lo52 = Math.min(...bars.slice(-250).map(b => b.l));
   return true;
@@ -2886,8 +2902,9 @@ function loadAuction() {
 }
 
 /* —— 涨停测算引擎：用本地缓存日线现场计算"开盘涨幅×量比→触板率"，替代硬编码表 ——
-   口径与离线回测一致：10% 主板口径、触板=盘中 high ≥ 昨收×1.099、样本不足 30 格回落默认值 */
-const LIMIT_STATS_KEY = 'qr_limitstats_v1';
+   口径：按板块涨跌停幅度判定（主板 10%，创业板/科创板 20%），分池统计；
+   触板 = 盘中 high ≥ 昨收×(1+涨停幅度-0.1%)；样本不足 30 格回落默认值 */
+const LIMIT_STATS_KEY = 'qr_limitstats_v2';   /* v2：10cm/20cm 分池，旧缓存口径不一致直接弃用 */
 function loadLimitStats() {
   try { const j = JSON.parse(localStorage.getItem(LIMIT_STATS_KEY) || 'null'); if (j && j.cells) state.limitStats = j; } catch (e) {}
 }
@@ -2895,64 +2912,83 @@ function saveLimitStats() { try { localStorage.setItem(LIMIT_STATS_KEY, JSON.str
 
 function computeLimitUpStats() {
   const t0 = Date.now();
-  /* 格：gap 4 桶 × vr 3 桶；hist 组合 5 项 */
+  /* 格：gap 4 桶 × vr 3 桶；hist 组合 5 项；10cm / 20cm 分池 */
   const G = [[1, 3], [3, 6], [6, 9], [9, 99]];
   const V = [[0, 1], [1, 2], [2, 99]];
-  const cells = G.map(() => V.map(() => ({ n: 0, hit: 0 })));
-  const hist = { ptGapUp: { n: 0, hit: 0 }, ptGapDn: { n: 0, hit:0 }, r15g6: { n: 0, hit: 0 }, r15g3: { n: 0, hit: 0 }, r15g1: { n: 0, hit: 0 } };
-  let total = 0, hits = 0;
+  const mkCells = () => G.map(() => V.map(() => ({ n: 0, hit: 0 })));
+  const mkHist = () => ({ ptGapUp: { n: 0, hit: 0 }, ptGapDn: { n: 0, hit:0 }, r15g6: { n: 0, hit: 0 }, r15g3: { n: 0, hit: 0 }, r15g1: { n: 0, hit: 0 } });
+  const cells = mkCells(), cells20 = mkCells();
+  const hist = mkHist(), hist20 = mkHist();
+  let total = 0, hits = 0, total20 = 0, hits20 = 0;
+  const todayStr = shToday();
   for (const code of Object.keys(state.data)) {
     const bars = state.data[code] && state.data[code].bars;
     if (!bars || bars.length < 70) continue;
-    for (let i = 61; i < bars.length; i++) {
+    /* 盘中最后一根是当日未完成 K 线，统计时剔除，避免半日样本污染 */
+    const end = (bars[bars.length - 1].d === todayStr && marketOpen()) ? bars.length - 1 : bars.length;
+    const is20 = isTwentyBoard(code);
+    const lim = is20 ? 1.199 : 1.099;
+    const CT = is20 ? cells20 : cells;
+    const HT = is20 ? hist20 : hist;
+    for (let i = 61; i < end; i++) {
       const prev = bars[i-1].c, o = bars[i].o, h = bars[i].h;
       if (!prev || !o || !h || prev <= 0) continue;
-      total++;
-      const limit = prev * 1.099, touch = h >= limit;
-      if (touch) hits++;
+      if (is20) total20++; else total++;
+      const limit = prev * lim, touch = h >= limit;
+      if (touch) { if (is20) hits20++; else hits++; }
       const g = (o / prev - 1) * 100;
-      const prevTouch = i >= 2 && bars[i-1].h >= bars[i-2].c * 1.099;
-      if (prevTouch && g < 0) { hist.ptGapDn.n++; if (touch) hist.ptGapDn.hit++; }
+      const prevTouch = i >= 2 && bars[i-1].h >= bars[i-2].c * lim;
+      if (prevTouch && g < 0) { HT.ptGapDn.n++; if (touch) HT.ptGapDn.hit++; }
       if (g < 1) continue;
       let vs = 0; for (let j = i - 20; j < i; j++) vs += bars[j].v || 0;
       const vr = (vs / 20) > 0 ? (bars[i].v || 0) / (vs / 20) : 1;
       const gi = G.findIndex(b => g >= b[0] && g < b[1]);
       const vi = V.findIndex(b => vr >= b[0] && vr < b[1]);
-      if (gi >= 0 && vi >= 0) { cells[gi][vi].n++; if (touch) cells[gi][vi].hit++; }
-      const prevTouch2 = prevTouch;
+      if (gi >= 0 && vi >= 0) { CT[gi][vi].n++; if (touch) CT[gi][vi].hit++; }
       const ret5 = i >= 6 ? (bars[i-1].c / bars[i-6].c - 1) * 100 : 0;
-      if (prevTouch2 && g >= 1) { hist.ptGapUp.n++; if (touch) hist.ptGapUp.hit++; }
+      if (prevTouch) { HT.ptGapUp.n++; if (touch) HT.ptGapUp.hit++; }
       if (!prevTouch && ret5 >= 15) {
-        if (g >= 6) { hist.r15g6.n++; if (touch) hist.r15g6.hit++; }
-        else if (g >= 3) { hist.r15g3.n++; if (touch) hist.r15g3.hit++; }
-        else { hist.r15g1.n++; if (touch) hist.r15g1.hit++; }
+        if (g >= 6) { HT.r15g6.n++; if (touch) HT.r15g6.hit++; }
+        else if (g >= 3) { HT.r15g3.n++; if (touch) HT.r15g3.hit++; }
+        else { HT.r15g1.n++; if (touch) HT.r15g1.hit++; }
       }
     }
   }
   const rate = b => (b.n >= 30) ? +(b.hit / b.n * 100).toFixed(1) : null;   /* 样本不足返回 null → 回落默认 */
+  const mkOut = src => ({
+    cells: src.cells.map(row => row.map(c => ({ n: c.n, p: rate(c) }))),
+    hist: Object.fromEntries(Object.entries(src.hist).map(([k, b]) => [k, { n: b.n, p: rate(b) }])),
+  });
+  const out10 = mkOut({ cells, hist }), out20 = mkOut({ cells: cells20, hist: hist20 });
   state.limitStats = {
     date: state.lastDate || dayStr(new Date()),
-    stocks: Object.keys(state.data).length, total, hits,
+    stocks: Object.keys(state.data).length,
+    total, hits, total20, hits20,
     base: total ? +(hits / total * 100).toFixed(2) : 0,
-    cells: cells.map(row => row.map(c => ({ n: c.n, p: rate(c) }))),
-    hist: Object.fromEntries(Object.entries(hist).map(([k, b]) => [k, { n: b.n, p: rate(b) }])),
+    base20: total20 ? +(hits20 / total20 * 100).toFixed(2) : 0,
+    cells: out10.cells, hist: out10.hist,
+    cells20: out20.cells, hist20: out20.hist,
     ms: Date.now() - t0,
   };
   saveLimitStats();
   return state.limitStats;
 }
 
-/* 竞价 → 当日盘中触及涨停概率（测算引擎驱动，qr_limitstats_v1；无测算时回落默认值）
-   离线基准：高开3-6%+量≥2≈47%；昨日触板+高开≥1%≈48%（连板效应）；20cm 票打 6 折 */
+/* 竞价 → 当日盘中触及涨停概率（测算引擎驱动，qr_limitstats_v2；无测算时回落默认值）
+   离线基准：高开3-6%+量≥2≈47%；昨日触板+高开≥1%≈48%（连板效应）
+   10cm / 20cm 已分池：优先用同板块实测格，20cm 样本不足时才用 10cm 值打 6 折 */
 function limitUpProb(code, pct, vr, hist) {
   const LS = state.limitStats;
+  const is20 = isTwentyBoard(code);
+  const G = [[1, 3], [3, 6], [6, 9], [9, 99]], V = [[0, 1], [1, 2], [2, 99]];
+  const gi = G.findIndex(b => pct >= b[0] && pct < b[1]);
+  const vi = V.findIndex(b => vr >= b[0] && vr < b[1]);
   let p = null;
-  /* 主表：gap × vr 实测格（样本不足格回落默认） */
-  if (LS && LS.cells) {
-    const G = [[1, 3], [3, 6], [6, 9], [9, 99]], V = [[0, 1], [1, 2], [2, 99]];
-    const gi = G.findIndex(b => pct >= b[0] && pct < b[1]);
-    const vi = V.findIndex(b => vr >= b[0] && vr < b[1]);
-    if (gi >= 0 && vi >= 0 && LS.cells[gi][vi].p != null) p = LS.cells[gi][vi].p;
+  const cells = LS ? (is20 ? LS.cells20 : LS.cells) : null;
+  if (cells && gi >= 0 && vi >= 0 && cells[gi][vi] && cells[gi][vi].p != null) p = cells[gi][vi].p;
+  if (p == null && is20 && LS && LS.cells && gi >= 0 && vi >= 0
+      && LS.cells[gi][vi] && LS.cells[gi][vi].p != null) {
+    p = Math.round(LS.cells[gi][vi].p * 0.6);
   }
   if (p == null) {
     if (pct >= 9) p = 95;
@@ -2961,29 +2997,30 @@ function limitUpProb(code, pct, vr, hist) {
     else if (pct >= 1) p = vr >= 2 ? 32 : vr >= 1.5 ? 15 : 9;
     else if (pct >= 0) p = 3;
     else p = 2;
+    if (is20) p = Math.round(p * 0.6);
   }
-  /* 昨日信号修正（优先实测值，样本不足回落默认） */
+  /* 昨日信号修正（优先同板块实测，其次 10cm 实测打 6 折，最后默认值） */
   if (hist) {
-    const H = LS && LS.hist ? LS.hist : {};
+    const H = LS ? (is20 ? (LS.hist20 || {}) : (LS.hist || {})) : {};
+    const pick = (key, dft) => {
+      if (H[key] && H[key].p != null) return H[key].p;
+      const h10 = LS && LS.hist && LS.hist[key];
+      if (h10 && h10.p != null) return is20 ? Math.round(h10.p * 0.6) : h10.p;
+      return is20 ? Math.round(dft * 0.6) : dft;
+    };
     if (hist.prevTouch) {
       if (pct >= 1) {
-        const m = H.ptGapUp && H.ptGapUp.p != null ? H.ptGapUp.p : 48;
+        const m = pick('ptGapUp', 48);
         p = Math.max(p, hist.ret5 >= 15 ? Math.min(95, m + 5) : m);
       } else if (pct < 0) {
-        const m = H.ptGapDn && H.ptGapDn.p != null ? H.ptGapDn.p : 16;
-        p = Math.min(p, m);
+        p = Math.min(p, pick('ptGapDn', 16));
       }
     } else if (hist.ret5 >= 15) {
       const key = pct >= 6 ? 'r15g6' : pct >= 3 ? 'r15g3' : pct >= 1 ? 'r15g1' : null;
       const dft = pct >= 6 ? 90 : pct >= 3 ? 44 : 21;
-      if (key) {
-        const m = H[key] && H[key].p != null ? H[key].p : dft;
-        p = Math.max(p, m);
-      }
+      if (key) p = Math.max(p, pick(key, dft));
     }
   }
-  const pre = code.slice(2, 4);
-  if (pre === '30' || pre === '68') p = Math.round(p * 0.6);   /* 20cm 涨停更难 */
   return Math.min(95, Math.max(1, Math.round(p)));
 }
 
@@ -3000,8 +3037,14 @@ function scoreAuction(r) {
   const prev = +r.f18;
   const listDay = r.f26 ? String(r.f26) : '';
 
-  /* 上市不足 60 日排除 */
-  if (listDay && listDay >= '20250901') return null;
+  /* 上市不足 60 个自然日排除（滚动窗口，不能写死日期） */
+  if (listDay) {
+    const base = dayFromStr(shToday());
+    if (base) {
+      const cut = dayStr(new Date(base.getTime() - 60 * 86400000)).replace(/-/g, '');
+      if (listDay >= cut) return null;
+    }
+  }
 
   let v = 0;
   const reasons = [], risks = [];
@@ -3037,21 +3080,28 @@ function scoreAuction(r) {
   let hist = null;
   if (x && x.ind) {
     const I = x.ind;
-    try {
-      if (I.uptrend) { v += 6; reasons.push('日线多头'); }
-      if (I.rsi6 >= 40 && I.rsi6 <= 70) { v += 4; reasons.push('RSI 健康'); }
-      if (I.k && I.d && I.k > I.d) { v += 3; reasons.push('KDJ 金叉'); }
-      if (I.ret60 > 0.05) { v += 3; reasons.push('中期趋势向上'); }
-    } catch (e) {}
-    /* 昨日信号：触板史 + 5日涨幅（连板效应实测 lift 5.6×） */
+    /* analyze() 返回的是 ma20/K/D/r6/ret60，旧代码读 I.uptrend/I.rsi6/I.k/I.d
+       全部为 undefined，技术面加分实际从未生效 —— 这里按真实字段重算 */
+    const c = last(I.c), ma20 = last(I.ma20), r6 = last(I.r6);
+    const uptrend = isNum(ma20) && c > ma20 && slope(I.ma20, 20) > 0;
+    if (uptrend) { v += 6; reasons.push('日线多头'); }
+    if (isNum(r6) && r6 >= 40 && r6 <= 70) { v += 4; reasons.push('RSI 健康'); }
+    if (isNum(last(I.K)) && isNum(last(I.D)) && last(I.K) > last(I.D)) { v += 3; reasons.push('KDJ 金叉'); }
+    if (I.ret60 > 0.05) { v += 3; reasons.push('中期趋势向上'); }
+    /* 昨日信号：触板史 + 5日涨幅（连板效应实测 lift 5.6×）
+       盘中今日 K 线可能已追加，必须回退到最后一根已完成日线 */
     const bars = x.bars;
-    if (bars && bars.length >= 7) {
-      const n = bars.length;
-      const prevTouch = bars[n - 1].h >= bars[n - 2].c * 1.099;
-      const ret5 = (bars[n - 1].c / bars[n - 6].c - 1) * 100;
-      hist = { prevTouch, ret5 };
-      if (prevTouch) { v += 5; reasons.push('昨日触板·连板预期'); }
-      else if (ret5 >= 15) { v += 3; reasons.push('5日动量强'); }
+    if (bars && bars.length >= 8) {
+      let n = bars.length;
+      if (bars[n - 1].d === shToday() && marketOpen()) n--;
+      if (n >= 7) {
+        const lim = isTwentyBoard(code) ? 1.199 : 1.099;
+        const prevTouch = bars[n - 1].h >= bars[n - 2].c * lim;
+        const ret5 = (bars[n - 1].c / bars[n - 6].c - 1) * 100;
+        hist = { prevTouch, ret5 };
+        if (prevTouch) { v += 5; reasons.push('昨日触板·连板预期'); }
+        else if (ret5 >= 15) { v += 3; reasons.push('5日动量强'); }
+      }
     }
   }
 
@@ -3270,7 +3320,7 @@ async function refreshFull(opts) {
       const r = await fetchBars(item[0], true);
       if (r.bars.length > 60) {
         const ix = { code: item[0], name: item[1], bars: r.bars, qt: r.qt || [] };
-        ix.ind = analyze(r.bars);
+        ix.ind = analyze(r.bars, item[0]);
         newIdx[item[0]] = ix;
       }
     } catch (e) { /* 指数失败不影响主流程 */ }
@@ -3513,7 +3563,7 @@ function applyCache(pack) {
     const nm = code === 'sh000001' ? '上证指数' : '创业板指';
     try {
       const ix = { code, name: nm, bars: raw.bars };
-      ix.ind = analyze(raw.bars);
+      ix.ind = analyze(raw.bars, code);
       state.indexes[code] = ix;
     } catch (e) {}
   }
@@ -3592,7 +3642,7 @@ async function ensureWatchStock(code) {
 
   /* analyze + 评分 */
   try {
-    x.ind = analyze(x.bars);
+    x.ind = analyze(x.bars, x.code);
     const ctx = { marketUp: true, secUp: {}, secRank: {}, indexes: state.indexes };
     /* 大盘条件 */
     const idx = state.indexes && state.indexes['sh000001'];
@@ -3950,8 +4000,8 @@ function cardHTML(x, mode, rank) {
   const bearGoldMark = (m === 'short' && state.bearGold) ? '<em style="color:var(--gold);font-weight:600">🔥黄金窗口</em>' : '';
   const aShareMark = (m === 'short' && (s.setup === 'limitup' || s.setup === 'gap')) ? '<em style="color:var(--cyan);font-weight:600">A股因子</em>' : '';
   const regimeMark = (m === 'short' && s.regime) ? (s.regime === 'down' ? '<em style="color:var(--purple);font-weight:600">熊市精选</em>' : '') : '';
-  /* 换手率粗估（日线替代因子） */
-  const estTR = (x.amount && x.mcap && x.mcap > 0) ? (x.amount / (x.mcap * 1e8) / 0.5 * 100) : null;
+  /* 换手率（优先实时值，缺失时粗估） */
+  const estTR = turnoverOf(x);
   const trMark = (estTR != null) ? ' · 换手≈' + estTR.toFixed(1) + '%' : '';
   /* 分钟级信号（VWAP 偏离、早盘强弱、尾盘抢筹）—— 均价按分钟数据所属交易日展示，过期置灰 */
   const minute = x.minute;
@@ -4671,7 +4721,9 @@ function limitStatsPanel() {
       '<div class="rv-g-stat"><span class="' + (b.p >= 30 ? 'up' : '') + '" style="font-size:13px">' + b.p + '%</span><small>n=' + b.n + '</small></div></div>';
   });
   return '<div class="notice" style="font-size:11px;padding:8px 10px">' +
-    '📐 <b>涨停测算引擎</b> · ' + LS.date + ' · ' + LS.stocks + ' 只 × ' + LS.total.toLocaleString() + ' 样本 · 基准触板率 <b>' + LS.base + '%</b>（触板=盘中摸到涨停价，非封板）' +
+    '📐 <b>涨停测算引擎</b> · ' + LS.date + ' · ' + LS.stocks + ' 只 · 主板 ' + LS.total.toLocaleString() + ' 样本 / 20cm ' + (LS.total20 || 0).toLocaleString() + ' 样本' +
+    ' · 主板基准 <b>' + LS.base + '%</b>' + (LS.total20 ? ' · 20cm 基准 <b>' + (LS.base20 || 0) + '%</b>' : '') +
+    '（触板=盘中摸到本板块涨停价，非封板；下表为主板 10cm，20cm 单独统计）' +
     '<div class="rv-groups" style="margin-top:6px">' + rows + '</div>' +
     (hrows ? '<div style="margin:6px 0 2px;color:var(--muted)">昨日信号组合（连板/强动量）</div><div class="rv-groups">' + hrows + '</div>' : '') +
     '<button class="btn" id="lsBtn" style="margin:8px auto 0">重新测算</button></div>';
@@ -4982,13 +5034,14 @@ function renderDetail() {
   const rating = s.score >= 85 ? '强' : s.score >= 75 ? '较强' : s.score >= 65 ? '中性偏强' : s.score >= 50 ? '中性' : '偏弱';
   const setupBlock = mode === 'short'
     ? '<div class="rr"><h4>短线形态 · ' + (s.setupName || '—') + '</h4>' +
-      '<div class="chips"><span class="chip">样本胜率 ' + (s.winRate || '—') + '%</span>' +
-      '<span class="chip">建议持有 ' + (s.horizon || '—') + '</span>' +
+      '<div class="chips"><span class="chip">' + (s.winRate != null ? '5日胜率 ' + s.winRate + '%' + (s.samples >= 30 ? ' · n=' + s.samples : '') : '胜率 —') + '</span>' +
+      '<span class="chip">建议持有 ' + (s.hold || '—') + '</span>' +
       '<span class="chip">' + (s.regime === 'down' ? '大盘下行' : '大盘多头') + '</span></div>' +
       '<p style="margin:8px 0 0;font-size:11px;line-height:1.6;color:var(--muted)">' + (s.setupNote || '') + '</p></div>'
     : '';
   const I = x.ind, c = last(I.c);
   const atrp = last(I.atr) / c * 100;
+  const trV = turnoverOf(x);
   /* 长期跟踪建议（仅自选股有锚定价） */
   const watchMetaX = state.watchMeta[x.code];
   const advPanel = starOn ? watchAdvice(x, watchMetaX) : null;
@@ -5026,7 +5079,7 @@ function renderDetail() {
     '<div class="stats">' +
       '<div class="stat"><div class="k">市盈率 TTM</div><div class="v num">' + (x.pe > 0 ? fmt(x.pe, 1) : '—') + '</div></div>' +
       '<div class="stat"><div class="k">市净率</div><div class="v num">' + (x.pb > 0 ? fmt(x.pb, 2) : '—') + '</div></div>' +
-      '<div class="stat"><div class="k">换手率</div><div class="v num">' + (x.turnover > 0 ? fmt(x.turnover, 2) + '%' : '—') + '</div></div>' +
+      '<div class="stat"><div class="k">换手率</div><div class="v num">' + (trV != null ? (x.turnover > 0 ? '' : '≈') + fmt(trV, 2) + '%' : '—') + '</div></div>' +
       '<div class="stat"><div class="k">量比</div><div class="v num">' + (x.volratio > 0 ? fmt(x.volratio, 2) : '—') + '</div></div>' +
       '<div class="stat"><div class="k">成交额</div><div class="v num">' + amtTxt(x.amount) + '</div></div>' +
       '<div class="stat"><div class="k">52周区间</div><div class="v num">' + fmt(x.lo52) + ' – ' + fmt(x.hi52) + '</div></div>' +
@@ -5037,6 +5090,7 @@ function renderDetail() {
           (mode === 'short' && s.setupName ? ' · ' + s.setupName : '') + '</b>' +
         '<p>' + (mode === 'long' ? '趋势结构 / 周线动能 / 相对强度 / 回撤控制' : 'KDJ 拐点 / MACD 动能 / 量能突破 / 短期动量') + '</p></div></div>' +
       '<div class="parts">' + parts + '</div>' +
+      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">分项为原始技术得分，综合分已按「形态 × 市场环境」校准，两者不必相加相等</p>' : '') +
     '</div>' +
     sigBlock +
     setupBlock +
