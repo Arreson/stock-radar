@@ -513,7 +513,8 @@ const state = {
   coverN: 0,           /* 本次深度分析的标的数 */
   auction: { rows: [], ts: 0, frozen: false, date: '', msg: '', phase: '' },
   btCost: 0.3,         /* 回测双边成本（%） */
-  btRange: null        /* 回测样本区间 [起始日期, 结束日期] */
+  btRange: null,       /* 回测样本区间 [起始日期, 结束日期] */
+  showChan: true       /* 详情图是否叠加缠论结构（笔/中枢） */
 };
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -718,6 +719,116 @@ function swings(bars, n = 3) {
   return { hi, lo };
 }
 
+/* ---------- 缠论结构（仅可视化，不参与评分/排序/回测） ----------
+   流程：包含关系处理 → 顶/底分型 → 笔（≥5根K线）→ 中枢（3笔重叠）
+   严格不接入推荐逻辑，仅在详情图上做结构标注。                  */
+function chanProcessInclusion(bars) {
+  if (!bars || bars.length < 3) {
+    return bars.map((b, i) => ({ hi: b.h, lo: b.l, idx: i }));
+  }
+  const out = [];
+  for (let i = 0; i < bars.length; i++) {
+    const cur = { hi: bars[i].h, lo: bars[i].l, idx: i };
+    const prev = out[out.length - 1];
+    if (!prev) { out.push(cur); continue; }
+    const incl = (cur.hi >= prev.hi && cur.lo <= prev.lo) ||
+                 (cur.hi <= prev.hi && cur.lo >= prev.lo);
+    if (!incl) { out.push(cur); continue; }
+    /* 方向由前前根与前根的高点关系决定 */
+    let dir = 'up';
+    if (out.length >= 2) {
+      const pp = out[out.length - 2];
+      if (prev.hi < pp.hi) dir = 'down';
+      else if (prev.hi > pp.hi) dir = 'up';
+      else dir = prev.lo < pp.lo ? 'down' : 'up';
+    }
+    if (dir === 'up') {
+      prev.hi = Math.max(prev.hi, cur.hi);
+      prev.lo = Math.max(prev.lo, cur.lo);
+    } else {
+      prev.hi = Math.min(prev.hi, cur.hi);
+      prev.lo = Math.min(prev.lo, cur.lo);
+    }
+    prev.idx = cur.idx; /* 合并后取较新的索引，便于后续笔长判定 */
+  }
+  return out;
+}
+
+function chanFindFractals(proc) {
+  const f = [];
+  for (let i = 1; i < proc.length - 1; i++) {
+    const a = proc[i - 1], b = proc[i], c = proc[i + 1];
+    if (b.hi > a.hi && b.hi > c.hi) f.push({ type: 'top', idx: b.idx, price: b.hi });
+    else if (b.lo < a.lo && b.lo < c.lo) f.push({ type: 'bottom', idx: b.idx, price: b.lo });
+  }
+  return f;
+}
+
+function chanBuildStrokes(fractals) {
+  let clean = fractals.slice();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    /* 1) 合并相邻同类型分型：顶取更高、底取更低 */
+    for (let i = 1; i < clean.length; i++) {
+      if (clean[i].type === clean[i - 1].type) {
+        const keep = (clean[i].type === 'top')
+          ? (clean[i].price > clean[i - 1].price ? clean[i] : clean[i - 1])
+          : (clean[i].price < clean[i - 1].price ? clean[i] : clean[i - 1]);
+        clean[i - 1] = keep;
+        clean.splice(i, 1);
+        changed = true;
+        break;
+      }
+    }
+    if (changed) continue;
+    /* 2) 执行 5 根 K 线规则：相邻分型索引差需 ≥ 4，否则丢弃后一个 */
+    for (let i = 0; i < clean.length - 1; i++) {
+      if (clean[i + 1].idx - clean[i].idx < 4) {
+        clean.splice(i + 1, 1);
+        changed = true;
+        break;
+      }
+    }
+  }
+  const strokes = [];
+  for (let i = 0; i < clean.length - 1; i++) {
+    const a = clean[i], b = clean[i + 1];
+    strokes.push({
+      fromIdx: a.idx, toIdx: b.idx,
+      fromPrice: a.price, toPrice: b.price,
+      type: a.type === 'top' ? 'down' : 'up',
+      hi: Math.max(a.price, b.price),
+      lo: Math.min(a.price, b.price)
+    });
+  }
+  return strokes;
+}
+
+function chanFindZhongshu(strokes) {
+  const zs = [];
+  for (let i = 0; i + 2 < strokes.length; i++) {
+    const s1 = strokes[i], s2 = strokes[i + 1], s3 = strokes[i + 2];
+    const zg = Math.min(s1.hi, s2.hi, s3.hi);
+    const zd = Math.max(s1.lo, s2.lo, s3.lo);
+    if (zg > zd) zs.push({ startIdx: s1.fromIdx, endIdx: s3.toIdx, zg, zd, dir: s1.type });
+  }
+  /* 合并相邻中枢：仅当价格区间仍有重叠时才延伸，避免 zg/zd 反转 */
+  const merged = [];
+  for (const z of zs) {
+    const last = merged[merged.length - 1];
+    const overlap = last && z.startIdx <= last.endIdx + 1 && z.zg > last.zd && z.zd < last.zg;
+    if (overlap) {
+      last.endIdx = Math.max(last.endIdx, z.endIdx);
+      last.zg = Math.min(last.zg, z.zg);
+      last.zd = Math.max(last.zd, z.zd);
+    } else {
+      merged.push({ ...z });
+    }
+  }
+  return merged;
+}
+
 function analyze(bars, code) {
   const o = bars.map(b => b.o), c = bars.map(b => b.c);
   const h = bars.map(b => b.h), l = bars.map(b => b.l), v = bars.map(b => b.v);
@@ -754,6 +865,12 @@ function analyze(bars, code) {
   }
   const swingLow = sl.length ? sl[sl.length - 1].p : null;   /* 最近确认摆动低点 → 结构止损 */
   const swingHigh = sh.length ? sh[sh.length - 1].p : null;  /* 最近确认摆动高点 → 突破参照 */
+
+  /* —— 缠论结构（仅可视化，不参与评分/排序） —— */
+  const chanProc = chanProcessInclusion(bars);
+  const chanFractals = chanFindFractals(chanProc);
+  const chanStrokes = chanBuildStrokes(chanFractals);
+  const chanZhongshu = chanFindZhongshu(chanStrokes);
 
   /* —— 量价关系：突破日量能倍数 / 顶背离 —— */
   const brkVol = last(vol20) > 0 ? last(v) / last(vol20) : 1;
@@ -875,6 +992,7 @@ function analyze(bars, code) {
     r2: r2(c, 120),
     hi250: Math.max(...h.slice(-250)), lo250: Math.min(...l.slice(-250)),
     structure, swingLow, swingHigh, brkVol, pNewHi, volDiverge,
+    chan: { strokes: chanStrokes, zhongshu: chanZhongshu },
     /* —— A 股日线独有 —— */
     limitStreak, upLimit20, downLimit20, sealStrength,
     gapUpToday, gapUnfilled, gapTrend, atrRank, volRatioRank
@@ -5735,6 +5853,29 @@ function renderDetail() {
       sigCell('量价健康', I.volDiverge ? '顶背离 ✗' : '正常 ✓', I.volDiverge ? 'off' : 'on') +
     '</div>';
 
+  /* 缠论结构信息（仅展示，不影响评分） */
+  const chan = I.chan;
+  let chanInfo = '';
+  if (chan && chan.strokes && chan.strokes.length) {
+    const ls = last(chan.strokes);
+    const strokeDir = ls.type === 'up' ? '上升笔' : '下降笔';
+    const lastZs = (chan.zhongshu && chan.zhongshu.length) ? last(chan.zhongshu) : null;
+    const curC = last(I.c);
+    let posTxt = '—';
+    if (lastZs) {
+      if (curC > lastZs.zg) posTxt = '站上中枢 ZG ' + fmt(lastZs.zg);
+      else if (curC < lastZs.zd) posTxt = '跌破中枢 ZD ' + fmt(lastZs.zd);
+      else posTxt = '中枢内 ' + fmt(lastZs.zd) + '–' + fmt(lastZs.zg);
+    }
+    chanInfo = '<div class="rr"><h4>缠论结构（日线）</h4>' +
+      '<div class="chips"><span class="chip">' + strokeDir + '</span>' +
+      (lastZs
+        ? '<span class="chip">中枢 ' + fmt(lastZs.zd) + ' – ' + fmt(lastZs.zg) + '</span><span class="chip">' + posTxt + '</span>'
+        : '<span class="chip">无成型中枢</span>') +
+      '</div>' +
+      '<p style="margin:6px 0 0;font-size:11px;line-height:1.6;color:var(--muted)">仅作结构可视化标注，不参与评分、排序与推荐。分型/笔/中枢按日线包含关系处理后识别，存在主观性，不构成买卖建议。</p></div>';
+  }
+
   panel.innerHTML =
     '<div class="grip"></div>' +
     '<div class="sh-head">' +
@@ -5768,7 +5909,8 @@ function renderDetail() {
     sigBlock +
     setupBlock +
     longBlock +
-    '<div class="chart-t"><span>价格走势 · 90日</span><span class="lg"><i class="d">MA20</i><i class="e">MA60</i></span></div>' +
+    chanInfo +
+    '<div class="chart-t"><span>价格走势 · 90日</span><span class="lg"><i class="d">MA20</i><i class="e">MA60</i><i class="chan-toggle' + (state.showChan ? ' on' : '') + '" style="color:#B98CF6;cursor:pointer;opacity:' + (state.showChan ? '1' : '.45') + '">缠论' + (state.showChan ? '' : '·关') + '</i></span></div>' +
     '<canvas class="chart" id="cPrice" style="height:208px"></canvas>' +
     '<div class="chart-t"><span>MACD(12,26,9)</span><span class="lg"><i class="d">DIF</i><i class="e">DEA</i></span></div>' +
     '<canvas class="chart" id="cMacd" style="height:84px"></canvas>' +
@@ -5998,6 +6140,41 @@ function drawPrice(cv, x, n) {
 
   drawLine(g, ma20, X, Y, C.gold, 1.1);
   drawLine(g, ma60, X, Y, C.cyan, 1.1);
+
+  /* —— 缠论结构叠加：中枢（矩形）在前，笔（连线）在后 —— */
+  if (state.showChan && x.ind && x.ind.chan) {
+    const ch = x.ind.chan;
+    if (ch.zhongshu && ch.zhongshu.length) {
+      ch.zhongshu.forEach(z => {
+        const xi1 = z.startIdx - off, xi2 = z.endIdx - off;
+        if (xi2 < 0 || xi1 >= bars.length) return;
+        const x1 = X(Math.max(0, xi1)), x2 = X(Math.min(bars.length - 1, xi2));
+        const y1 = Y(z.zg), y2 = Y(z.zd);
+        const ry = Math.min(y1, y2), rh = Math.max(1, Math.abs(y2 - y1));
+        g.fillStyle = 'rgba(185,140,246,.10)';
+        g.fillRect(x1, ry, Math.max(1, x2 - x1), rh);
+        g.strokeStyle = 'rgba(185,140,246,.45)';
+        g.lineWidth = 1;
+        g.setLineDash([3, 3]);
+        g.strokeRect(x1, ry, Math.max(1, x2 - x1), rh);
+        g.setLineDash([]);
+      });
+    }
+    if (ch.strokes && ch.strokes.length) {
+      ch.strokes.forEach(s => {
+        const i1 = s.fromIdx - off, i2 = s.toIdx - off;
+        if (i2 < 0 || i1 >= bars.length) return;
+        g.strokeStyle = s.type === 'up' ? C.up : C.down;
+        g.lineWidth = 1.7;
+        g.lineJoin = 'round';
+        g.beginPath();
+        g.moveTo(X(i1), Y(s.fromPrice));
+        g.lineTo(X(i2), Y(s.toPrice));
+        g.stroke();
+      });
+      g.lineJoin = 'miter';
+    }
+  }
 
   const vmax = Math.max(...bars.map(b => b.v), 1);
   bars.forEach((b, i) => {
@@ -6611,6 +6788,13 @@ function bindEvents() {
     if (star) {
       toggleWatch(star.dataset.code);
       renderDetail();
+      return;
+    }
+    const chanT = e.target.closest('.chan-toggle');
+    if (chanT && state.detail) {
+      state.showChan = !state.showChan;
+      renderDetail();
+      return;
     }
   });
 
