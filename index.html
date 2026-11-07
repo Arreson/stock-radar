@@ -514,7 +514,8 @@ const state = {
   auction: { rows: [], ts: 0, frozen: false, date: '', msg: '', phase: '' },
   btCost: 0.3,         /* 回测双边成本（%） */
   btRange: null,       /* 回测样本区间 [起始日期, 结束日期] */
-  showChan: true       /* 详情图是否叠加缠论结构（笔/中枢） */
+  showChan: true,      /* 详情图是否叠加缠论结构（笔/中枢） */
+  closeCache: { date: '', volratio: {} }  /* 按日缓存收盘时量比，闭市后复用（避免实时量比归零导致短线列表为空） */
 };
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -2708,6 +2709,12 @@ function parseQt(x) {
   x.mcap = n(45);
   x.amount = n(37);
   x.volratio = n(49);
+  /* 盘中持续记录当日量比到收盘缓存；闭市后不覆盖，保留收盘前最后有效值 */
+  if (marketOpen && marketOpen() && isNum(x.volratio) && x.volratio > 0) {
+    const today = shToday();
+    if (state.closeCache.date !== today) state.closeCache = { date: today, volratio: {} };
+    state.closeCache.volratio[x.code] = x.volratio;
+  }
 }
 
 function buildEntry(meta, raw) {
@@ -3580,6 +3587,20 @@ function loadLimitStats() {
 }
 function saveLimitStats() { try { localStorage.setItem(LIMIT_STATS_KEY, JSON.stringify(state.limitStats)); } catch (e) {} }
 
+/* 收盘量比缓存：盘中每次报价刷新都写入当日量比；闭市后腾讯实时量比会归零/失真，
+   短线「量比≥1.2」过滤需复用收盘前的量比，否则列表会变空。按日轮转，次日自动清空。 */
+const CLOSE_CACHE_KEY = 'qr_closecache_v1';
+function loadCloseCache() {
+  try {
+    const j = JSON.parse(localStorage.getItem(CLOSE_CACHE_KEY) || 'null');
+    if (j && j.date && j.volratio) {
+      const today = shToday();
+      state.closeCache = (j.date === today) ? j : { date: today, volratio: {} };
+    }
+  } catch (e) {}
+}
+function saveCloseCache() { try { localStorage.setItem(CLOSE_CACHE_KEY, JSON.stringify(state.closeCache)); } catch (e) {} }
+
 function computeLimitUpStats() {
   const t0 = Date.now();
   /* 格：gap 4 桶 × vr 3 桶；hist 组合 5 项；10cm / 20cm 分池 */
@@ -4046,6 +4067,7 @@ async function refreshFull(opts) {
     const dates = Object.values(nd).map(x => x.lastDate).filter(Boolean).sort();
     state.lastDate = dates[dates.length - 1] || '';
     saveCache();
+    saveCloseCache();
     showSync(false);
     showOverlay(false);
     render();
@@ -4143,6 +4165,7 @@ async function quickQuote(silent) {
     if (dates.length) state.lastDate = dates[dates.length - 1];
     state.hasCache = true;
     saveCache();
+    saveCloseCache();
     render();
     if (!silent) toast('报价已更新 · ' + ok + ' 只', 1800);
   }
@@ -4810,7 +4833,11 @@ function renderList() {
        3 日胜率 48.8%→52.1%、5 日 48.9%→52.3%，均收 0.41%→1.02% / 0.70%→1.02%
        9/12 年跑赢基线（2015 样本少、2023 例外）。覆盖率约 16%，属"精选"而非全市场铺开 */
     const volOK = x => {
-      if (isNum(x.volratio) && x.volratio > 0) return x.volratio >= 1.2;  /* 腾讯实时量比（已按分钟归一） */
+      /* 闭市后腾讯实时量比会归零/失真，优先复用收盘前缓存的量比 */
+      const closed = !marketOpen();
+      const cached = closed && state.closeCache.date === today ? state.closeCache.volratio[x.code] : null;
+      const vr = (isNum(cached) && cached > 0) ? cached : x.volratio;
+      if (isNum(vr) && vr > 0) return vr >= 1.2;                          /* 腾讯实时量比（已按分钟归一） */
       const I = x.ind;
       if (!I) return true;
       const v20 = last(I.vol20);
@@ -6886,6 +6913,7 @@ async function init() {
   loadNorth();
   loadLimitStats();
   loadLhb();
+  loadCloseCache();
   /* 竞价 × 短线合并：交易日 9:15–9:30 打开应用，默认进入短线机会页并直接展示当日竞价 */
   const ph0 = auctionPhase();
   if (ph0 === 'calling' || ph0 === 'frozen') state.tab = 'short';
