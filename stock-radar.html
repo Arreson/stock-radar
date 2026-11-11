@@ -3925,7 +3925,7 @@ function normalizeMarket(rows, todayStr) {
 
 /* 热门板块：全市场快照按行业（东财二级）聚合，等权平均涨幅排名，取前 HOT_SECTOR_N。
    仅作为推荐过滤层，不参与评分/排序；涨停家数与成交额用于展示。 */
-const HOT_SECTOR_N = 20;   /* 全市场约 86 个二级行业，前 20 ≈ 前 1/4 */
+const HOT_SECTOR_N = 30;   /* 全市场约 86 个二级行业，前 30 ≈ 前 1/3 */
 function computeHotSectors(norm, date) {
   const agg = {};
   for (const r of norm) {
@@ -3946,8 +3946,11 @@ function computeHotSectors(norm, date) {
 /* 推荐过滤用的热门板块查找表：优先全市场快照口径；无快照（旧缓存/快照失败）时退化为
    当前扫描池内板块均值 Top5（口径较弱，仅兜底）；都没有返回 null（不过滤，避免空列表） */
 function hotSet() {
-  if (state.hot && state.hot.list && state.hot.list.length) {
-    const m = {}; state.hot.list.forEach(s => { m[s] = 1; }); return m;
+  /* 优先按 rows 动态取前 N（口径 N 调整后旧缓存也立即适用）；list 字段仅作兼容兜底 */
+  const src = (state.hot && state.hot.rows && state.hot.rows.length) ? state.hot.rows.slice(0, HOT_SECTOR_N).map(r => r.sector)
+    : (state.hot && state.hot.list) || [];
+  if (src.length) {
+    const m = {}; src.forEach(s => { m[s] = 1; }); return m;
   }
   const agg = {};
   for (const x of Object.values(state.data)) {
@@ -4767,11 +4770,12 @@ function diversify(arr) {
 function sortedList(mode) {
   let arr = Object.values(state.data).filter(x => x.long && x.short);
   arr = arr.filter(x => matchQuery(x, state.search) && (state.ind === '全部' || x.sector === state.ind));
-  /* 热门板块过滤：只在默认推荐视图生效（所有推荐只出自热门板块）；
+  /* 热门板块过滤：只在默认推荐视图生效（推荐只出自热门板块）；
+     长线 ≥75 分的高质量股豁免（震荡市不挡高分冷门股）；
      用户手动选行业/搜索时尊重其选择，不再叠加 */
   if (!state.search && state.ind === '全部') {
     const hs = hotSet();
-    if (hs) arr = arr.filter(x => hs[x.sector]);
+    if (hs) arr = arr.filter(x => hs[x.sector] || (mode === 'long' && x.long.score >= 75));
   }
   /* 短线排序键 = 执行分（风控口径，非收益预测）；综合分已因未通过样本外验证退出排序 */
   arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score : (b.short.exec || 0) - (a.short.exec || 0));
@@ -4818,7 +4822,12 @@ function cardHTML(x, mode, rank) {
   /* 竞价 × 短线合并：若该票出现在今日竞价 Top20，标注竞价涨幅（仅标注，不影响评分/过滤） */
   const au = m === 'short' ? auctionHit(x.code) : null;
   const auMark = au ? '<em style="color:var(--cyan)">竞价' + signTxt(au.pct) + '</em>' : '';
-  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark + (nextDayMark && auMark ? ' ' : '') + auMark;
+  /* 长线高分豁免标记：不在热门板块但 ≥75 分被保留的标的（仅标注，不影响评分） */
+  const exemptMark = (m === 'long' && !state.search && state.ind === '全部') ? (() => {
+    const hs = hotSet();
+    return (hs && !hs[x.sector] && x.long.score >= 75) ? '<em style="color:var(--gold);font-weight:600">高分豁免</em> ' : '';
+  })() : '';
+  const footExtra = exemptMark + bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark + (nextDayMark && auMark ? ' ' : '') + auMark;
   const footShort = '执行 ' + Math.round(s.exec || 0) + ' · ' + (s.pool === 'oversold' ? '超跌观察池·' : '') + (s.setupName || '') +
     ' · 量比 ' + (isNum(s.vr5) ? fmt(s.vr5, 1) : '—') + ' / J ' + (isNum(s.jv) ? fmt(s.jv, 0) : '—') +
     (s.winRate3 != null && s.winRate != null
@@ -4972,7 +4981,8 @@ function renderList() {
       .map(r => r.sector + ' <b class="' + (r.avgPct >= 0 ? 'up' : 'down') + '">' + (r.avgPct >= 0 ? '+' : '') + r.avgPct + '%</b>')
       .join(' · ');
     html += '<div class="notice" style="font-size:11px;padding:6px 10px">🔥 热门板块（' + (state.hot.date || '最近交易日') +
-      ' 全市场行业涨幅前' + HOT_SECTOR_N + '）：' + top + ' —— 推荐仅从热门板块中筛选</div>';
+      ' 全市场行业涨幅前' + HOT_SECTOR_N + '）：' + top + ' —— 推荐仅从热门板块中筛选' +
+      (mode === 'long' ? '（≥75 分长线股豁免）' : '') + '</div>';
   }
   if (IS_FILE) {
     html += '<div class="notice">本地直开模式：行情经脚本 JSONP 通道直连东财/腾讯，不依赖服务器与隧道；首次拉取若较慢属正常。</div>';
