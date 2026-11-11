@@ -5041,7 +5041,13 @@ function renderList() {
       /* 综合分门槛已移除：未通过样本外验证的分数不作为过滤条件（诚实口径） */
       if (!volOK(x)) return false;
       const J = x.ind ? last(x.ind.J) : NaN;
-      if (isFinite(J) && J >= 80) return false;                           /* J>80 超买，次日回落概率高 */
+      /* J 阈值随市场环境自适应：
+         - 熊市（上证在 MA20 下方）：J≥80 视为超买，次日回落概率高，保持 <80 严格过滤；
+         - 牛市（上证在 MA20 上方）：突破/趋势延续形态天然伴随高 J，放宽到 <100，
+           只剔除 J≥100 的高位钝化（KDJ-J 连续超买区，回测中次日回落概率显著升高）。
+         11 年回测中「量比≥1.2 + J<80」3日胜率 52.1%；放宽到 J<100 会略降胜率但避免强趋势市 0 出票。 */
+      const jMax = state.marketUp === false ? 80 : 100;
+      if (isFinite(J) && J >= jMax) return false;
       coolMap[x.code] = today;                                            /* 仅通过的信号才计入冷却期 */
       return true;
     });
@@ -5132,7 +5138,7 @@ function renderList() {
     html += '<div class="notice' + (gateOK ? '' : ' warn') + '">' + (
       gateOK
         ? '<b>评分已通过样本外门槛</b>：Q5−Q1 5 日胜率/均收为正，组合 Sharpe ' + pf.sharpe + '、Calmar ' + pf.calmar + '。'
-        : '<b>短线综合分未通过样本外验证，已退出排序与展示。</b>推荐名单 = 形态白名单 + 量比≥1.2 + J&lt;80（11 年实测有效），池内按执行分（流动性/波动/收益成本比）排序，不构成收益预测。' +
+        : '<b>短线综合分未通过样本外验证，已退出排序与展示。</b>推荐名单 = 形态白名单 + 量比≥1.2 + J 阈值（牛市<100 / 熊市<80，11 年实测有效），池内按执行分（流动性/波动/收益成本比）排序，不构成收益预测。' +
           (vv && vv.length >= 2
             ? ' 验证记录 Q5−Q1：5 日均收 ' + ((vv[vv.length - 1].avg5 - vv[0].avg5) >= 0 ? '+' : '') + (vv[vv.length - 1].avg5 - vv[0].avg5).toFixed(2) + 'pp、5 日胜率 ' + (vv[vv.length - 1].wr5 - vv[0].wr5) + 'pp'
             : ' 尚未跑滚动回测') +
@@ -5167,7 +5173,7 @@ function renderList() {
   if (mode === 'short' && !filtered.length && !state.search && state.ind === '全部') {
     const topNow = arr.filter(x => x.short && isNum(x.short.exec)).slice(0, 5)
       .map(x => x.name + ' 执行' + Math.round(x.short.exec)).join(' · ');
-    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J&lt;80 的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
+    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J（牛市&lt;100 / 熊市&lt;80）的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
       (topNow ? '<p style="font-size:11px;color:var(--muted)">池内最高执行分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
       '<div class="disc"><b>风险提示：</b>不构成投资建议。</div>';
     head.innerHTML = html;
@@ -6131,7 +6137,7 @@ function renderDetail() {
           (mode === 'short' && s.setupName ? ' · ' + s.setupName : '') + '</b>' +
         '<p>' + (mode === 'long' ? '估值分位 · 质量 · 红利 · 反转 · 低波 · GARP（行业分位）' : '流动性 · 波动约束 · 收益/成本比（短线排序唯一依据）') + '</p></div></div>' +
       '<div class="parts">' + parts + '</div>' +
-      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">下方分项为研究用综合分（未通过样本外验证，已退出推荐排序）；推荐依据 = 形态白名单 + 量比≥1.2 + J&lt;80，11 年实测有效</p>' : '') +
+      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">下方分项为研究用综合分（未通过样本外验证，已退出推荐排序）；推荐依据 = 形态白名单 + 量比≥1.2 + J 阈值（牛市&lt;100 / 熊市&lt;80），11 年实测有效</p>' : '') +
     '</div>' +
     sigBlock +
     setupBlock +
