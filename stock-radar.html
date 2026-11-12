@@ -1588,6 +1588,176 @@ function volValidation() {
   return state.volValid;
 }
 
+/* =============== 因子有效性检验（IC / IR / 分层 / 样本外） ===============
+   只检验价量因子：本地没有 point-in-time 财务数据，估值/质量/红利/GARP
+   这类基本面因子无法做历史横截面检验，界面上必须如实说明，不能假装验证过。
+   方法：每 5 个交易日取一个横截面，计算因子值与「未来 5 日收盘收益」的 Spearman
+   秩相关（Rank IC）；按时间前 70% / 后 30% 切分样本内与样本外，规则冻结、不重调参。
+   ⚠ 样本池是当前扫描入选股（非历史全市场成分），存在选择/幸存者偏差。 */
+const FACTOR_DEFS = [
+  { key: 'mom20', name: '20 日动量', dir: '正向', fn: (b, i) => (i >= 20 && b[i - 20].c > 0) ? b[i].c / b[i - 20].c - 1 : null },
+  { key: 'mom60', name: '60 日动量', dir: '正向', fn: (b, i) => (i >= 60 && b[i - 60].c > 0) ? b[i].c / b[i - 60].c - 1 : null },
+  { key: 'rev5', name: '5 日反转', dir: '反向', fn: (b, i) => (i >= 5 && b[i - 5].c > 0) ? b[i].c / b[i - 5].c - 1 : null },
+  { key: 'vol20', name: '20 日波动率', dir: '反向', fn: (b, i) => {
+      if (i < 21) return null;
+      let s = 0, n = 0;
+      for (let j = i - 19; j <= i; j++) {
+        if (b[j - 1].c > 0 && b[j].c > 0) { const r = Math.log(b[j].c / b[j - 1].c); s += r * r; n++; }
+      }
+      return n >= 15 ? Math.sqrt(s / n) : null;
+    } },
+  { key: 'vr5', name: '量比（5 日）', dir: '正向', fn: (b, i) => {
+      if (i < 5) return null;
+      let s = 0;
+      for (let j = i - 5; j < i; j++) s += b[j].v || 0;
+      const base = s / 5;
+      return base > 0 ? (b[i].v || 0) / base : null;
+    } },
+  { key: 'ma20dev', name: '20 日线偏离', dir: '正向', fn: (b, i) => {
+      if (i < 19) return null;
+      let s = 0;
+      for (let j = i - 19; j <= i; j++) s += b[j].c;
+      const ma = s / 20;
+      return ma > 0 ? b[i].c / ma - 1 : null;
+    } },
+  { key: 'amt20', name: '20 日成交额', dir: '正向', fn: (b, i) => {
+      if (i < 19) return null;
+      let s = 0, n = 0;
+      for (let j = i - 19; j <= i; j++) {
+        if (b[j].c > 0 && b[j].v > 0) { s += b[j].c * b[j].v; n++; }
+      }
+      return n >= 10 ? Math.log(s / n) : null;
+    } }
+];
+
+function labRank(arr) {
+  const idx = arr.map((_, i) => i).sort((a, b) => arr[a] - arr[b]);
+  const out = new Array(arr.length);
+  let i = 0;
+  while (i < idx.length) {
+    let j = i;
+    while (j + 1 < idx.length && arr[idx[j + 1]] === arr[idx[i]]) j++;
+    const r = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) out[idx[k]] = r;
+    i = j + 1;
+  }
+  return out;
+}
+
+function labSpearman(a, b) {
+  const n = a.length;
+  if (n < 3) return null;
+  const ra = labRank(a), rb = labRank(b);
+  let sa = 0, sb = 0;
+  for (let i = 0; i < n; i++) { sa += ra[i]; sb += rb[i]; }
+  const ma = sa / n, mb = sb / n;
+  let cov = 0, va = 0, vb = 0;
+  for (let i = 0; i < n; i++) {
+    const da = ra[i] - ma, db = rb[i] - mb;
+    cov += da * db; va += da * da; vb += db * db;
+  }
+  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : null;
+}
+
+function labAcc() { return { ics: [], q: [[], [], [], [], []] }; }
+function labPush(acc, ic, qm) {
+  if (!isNum(ic)) return;
+  acc.ics.push(ic);
+  for (let k = 0; k < 5; k++) if (isNum(qm[k])) acc.q[k].push(qm[k]);
+}
+function labSummary(acc) {
+  const ics = acc.ics, n = ics.length;
+  if (n < 2) return { n, meanIc: null, ir: null, t: null, pos: null, q: [null, null, null, null, null], spread: null, mono: 0 };
+  const mean = ics.reduce((s, x) => s + x, 0) / n;
+  const sd = Math.sqrt(ics.reduce((s, x) => s + (x - mean) * (x - mean), 0) / (n - 1));
+  const q = acc.q.map(a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
+  const up = isNum(q[4]) && isNum(q[0]) && q[4] >= q[0];
+  let mono = 0;
+  for (let k = 0; k < 4; k++) {
+    if (isNum(q[k]) && isNum(q[k + 1]) && (q[k + 1] - q[k]) * (up ? 1 : -1) > 0) mono++;
+  }
+  return {
+    n,
+    meanIc: mean,
+    ir: sd > 0 ? mean / sd : null,
+    t: sd > 0 ? mean / (sd / Math.sqrt(n)) : null,
+    pos: ics.filter(x => x > 0).length / n * 100,
+    q,
+    spread: isNum(q[4]) && isNum(q[0]) ? (q[4] - q[0]) * 100 : null,
+    mono
+  };
+}
+
+function factorLab() {
+  if (state.factorLab && state.factorLab.ts === state.ts) return state.factorLab;
+  const stocks = Object.values(state.data).filter(x => x.bars && x.bars.length >= 320);
+  if (stocks.length < 20) return { insufficient: true, reason: '当前样本池不足 20 只（需先完成一次全市场扫描）' };
+
+  const dateSet = new Set();
+  stocks.forEach(x => { for (const b of x.bars) dateSet.add(b.d); });
+  const dates = Array.from(dateSet).sort();
+  const sample = [];
+  for (let i = 70; i < dates.length; i += 5) sample.push(dates[i]);
+  if (sample.length < 60) return { insufficient: true, reason: '可用历史不足 60 个采样点（约 1 年余），样本外检验不成立' };
+  const cutIdx = Math.floor(sample.length * 0.7);
+
+  const idxMap = new Map();
+  stocks.forEach(x => {
+    const m = new Map();
+    x.bars.forEach((b, i) => m.set(b.d, i));
+    idxMap.set(x.code, m);
+  });
+
+  const accs = FACTOR_DEFS.map(() => ({ all: labAcc(), is: labAcc(), oos: labAcc() }));
+  let obs = 0;
+  sample.forEach((d, si) => {
+    const split = si < cutIdx ? 'is' : 'oos';
+    const xs = [];
+    for (const x of stocks) {
+      const i = idxMap.get(x.code).get(d);
+      if (i == null || i + 5 >= x.bars.length) continue;
+      const vals = {}, fwd = x.bars[i + 5].c / x.bars[i].c - 1;
+      if (!isNum(fwd)) continue;
+      let ok = true;
+      for (const f of FACTOR_DEFS) {
+        const v = f.fn(x.bars, i);
+        if (!isNum(v)) { ok = false; break; }
+        vals[f.key] = v;
+      }
+      if (ok) xs.push({ vals, fwd });
+    }
+    if (xs.length < 20) return;
+    obs += xs.length;
+    FACTOR_DEFS.forEach((f, fi) => {
+      const vals = xs.map(o => o.vals[f.key]);
+      const fwds = xs.map(o => o.fwd);
+      const ic = labSpearman(vals, fwds);
+      if (!isNum(ic)) return;
+      const order = vals.map((_, i) => i).sort((a, b) => vals[a] - vals[b]);
+      const qs = [0, 0, 0, 0, 0].map(() => ({ s: 0, n: 0 }));
+      order.forEach((oi, rank) => {
+        const g = Math.min(4, Math.floor(rank / xs.length * 5));
+        qs[g].s += fwds[oi]; qs[g].n++;
+      });
+      const qm = qs.map(q => q.n ? q.s / q.n : null);
+      labPush(accs[fi].all, ic, qm);
+      labPush(accs[fi][split], ic, qm);
+    });
+  });
+  idxMap.clear();
+
+  const factors = FACTOR_DEFS.map((f, fi) => ({
+    key: f.key, name: f.name, dir: f.dir,
+    all: labSummary(accs[fi].all), is: labSummary(accs[fi].is), oos: labSummary(accs[fi].oos)
+  }));
+  state.factorLab = {
+    ts: state.ts, stocks: stocks.length, obs, dates: sample.length,
+    fwdDays: 5, cutDate: sample[cutIdx],
+    isDates: cutIdx, oosDates: sample.length - cutIdx, factors
+  };
+  return state.factorLab;
+}
+
 /* 短线形态基准统计（已按实盘同口径：20 日冷却 + 量比≥1.2 + J<80 过滤）
    数据口径 = 11 年 · 91 只 · 8,733 信号（过滤后 1,410）· T+1 开盘成交 · 双边 0.3% 成本
    3=3日胜率/均收，5=5日 ------------------------------------------------------------ */
@@ -5245,7 +5415,8 @@ function renderList() {
           ? ' 放量组相对基线有正超额，量能维度方向成立。'
           : (edge5 > 0 ? ' 放量组仅微弱超额，量能权重宜谨慎。'
             : ' ⚠ 放量组未跑赢基线，量能维度不作收益承诺。')) +
-        (edgeThin > 0 ? '（缩量组反而更强，说明单靠放量择时不充分。）' : '') + '</div>';
+        (edgeThin > 0 ? '（缩量组反而更强，说明单靠放量择时不充分。）' : '') +
+        ' 因子 IC/IR、五分层与样本外检验见「策略」页<b>因子有效性检验</b>。</div>';
     }
   }
   if (mode === 'short' && !state.search && state.ind === '全部') {
@@ -5929,6 +6100,66 @@ function renderReview() {
   $$('.rv-row').forEach(el => el.addEventListener('click', () => openDetail(el.dataset.code)));
 }
 
+/* 因子实验室 UI：IC/IR、五分层、样本内 vs 样本外 */
+function buildFactorLabHTML() {
+  const L = state.factorLab;
+  const fmtIc = v => isNum(v) ? (v >= 0 ? '+' : '') + v.toFixed(3) : '—';
+  const icCls = v => !isNum(v) ? '' : (v >= 0 ? 'up' : 'down');
+  const col = v => !isNum(v) ? 'var(--muted)' : (v >= 0 ? 'var(--up)' : 'var(--down)');
+  const verdict = (a, o) => {
+    if (!a || a.n < 2 || !isNum(a.meanIc)) return '<span style="color:var(--muted)">样本不足</span>';
+    if (!o || o.n < 2 || !isNum(o.meanIc)) return '<span style="color:var(--muted)">样本外不足</span>';
+    if (a.meanIc * o.meanIc <= 0) return '<span style="color:var(--gold)">样本外反转</span>';
+    if (Math.abs(a.meanIc) >= 0.03 && isNum(a.ir) && Math.abs(a.ir) >= 0.3) return '<span style="color:var(--up)">有效</span>';
+    if (Math.abs(a.meanIc) >= 0.02) return '<span style="color:var(--txt)">弱有效</span>';
+    return '<span style="color:var(--muted)">无显著优势</span>';
+  };
+
+  let body = '';
+  if (!L) {
+    body = '<p class="dim">尚未运行。检验只读取历史日线做统计，不改变任何评分权重。</p>';
+  } else if (L.insufficient) {
+    body = '<p class="notice warn" style="font-size:11px">' + L.reason + '</p>';
+  } else {
+    const avgN = L.dates ? Math.round(L.obs / L.dates) : 0;
+    const rows = L.factors.map(f => {
+      const a = f.all;
+      return '<tr><td><b>' + f.name + '</b><div class="dim" style="font-size:9px">' + f.dir + '</div></td>' +
+        '<td class="' + icCls(a.meanIc) + '"><b>' + fmtIc(a.meanIc) + '</b></td>' +
+        '<td>' + (isNum(a.ir) ? a.ir.toFixed(2) : '—') + '</td>' +
+        '<td>' + (isNum(a.t) ? a.t.toFixed(1) : '—') + '</td>' +
+        '<td>' + (isNum(a.pos) ? Math.round(a.pos) + '%' : '—') + '</td>' +
+        '<td style="color:' + col(a.spread) + '"><b>' + (isNum(a.spread) ? (a.spread >= 0 ? '+' : '') + a.spread.toFixed(2) + 'pp' : '—') + '</b></td>' +
+        '<td>' + a.mono + '/4</td></tr>';
+    }).join('');
+    const oosRows = L.factors.map(f => {
+      const o = f.oos;
+      return '<tr><td><b>' + f.name + '</b></td>' +
+        '<td class="' + icCls(o.meanIc) + '">' + fmtIc(o.meanIc) + '</td>' +
+        '<td style="color:' + col(o.spread) + '">' + (isNum(o.spread) ? (o.spread >= 0 ? '+' : '') + o.spread.toFixed(2) + 'pp' : '—') + '</td>' +
+        '<td>' + (isNum(o.pos) ? Math.round(o.pos) + '%' : '—') + '</td>' +
+        '<td>' + verdict(f.all, f.oos) + '</td></tr>';
+    }).join('');
+    body = '<p class="dim" style="font-size:11px">样本池 ' + L.stocks + ' 只 · 采样 ' + L.dates + ' 期（每期均 ' + avgN +
+      ' 条截面）· 样本内 ' + L.isDates + ' 期 / 样本外 ' + L.oosDates + ' 期（以 <b>' + L.cutDate + '</b> 切分）· 因子值 → 未来 ' + L.fwdDays + ' 日收盘收益，未扣成本</p>' +
+      '<h4>全样本（Rank IC · 五分层）</h4><div style="overflow-x:auto"><table class="bt">' +
+      '<thead><tr><th>因子</th><th>均值 IC</th><th>IR</th><th>t 值</th><th>IC&gt;0</th><th>Q5−Q1</th><th>单调</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<h4>样本外（后 ' + L.oosDates + ' 期，规则冻结）</h4><div style="overflow-x:auto"><table class="bt">' +
+      '<thead><tr><th>因子</th><th>均值 IC</th><th>Q5−Q1</th><th>IC&gt;0</th><th>判定</th></tr></thead><tbody>' + oosRows + '</tbody></table></div>';
+  }
+
+  const cfg = '<div style="display:flex;gap:10px;margin-top:10px">' +
+    '<button class="btn" id="runFactorBtn" style="flex:1">运行因子检验（IC / 分层 / 样本外）</button>' +
+    (L && !L.insufficient ? '<button class="btn" id="clearFactorBtn" style="flex:0 0 auto">清除</button>' : '') + '</div>';
+
+  return '<section><h3>因子有效性检验 <em>FACTOR IC · OUT-OF-SAMPLE</em></h3>' +
+    '<p>每 5 个交易日取一个横截面，计算各价量因子与<b>未来 5 日收益</b>的 Spearman 秩相关（Rank IC）；再按因子值分五层看 Q1→Q5 的前瞻收益是否单调。样本按时间前 70% / 后 30% 切分，样本外<b>不重新调参、不重挑因子</b>，直接沿用样本内的统计口径，用来判断因子方向是否被拟合。</p>' +
+    body +
+    '<p class="dim" style="font-size:11px">IC 为正 = 因子值越大、未来 5 日收益越高；为负表示反向有效（如反转/低波因子）。IR = 均值 IC ÷ IC 标准差，|IC|≥0.03 且 |IR|≥0.3 才算有效；样本外与样本内同号才说明方向稳定。Q5−Q1 为最高分位减最低分位的 5 日平均收益差（pp），「单调」= 五层收益沿因子方向递增/递减的步数（满分 4）。</p>' +
+    '<p class="notice" style="font-size:11px">⚠ <b>只覆盖价量因子</b>：本地没有 point-in-time 财务数据，估值 / 质量 / 红利 / GARP 等基本面因子无法做历史 IC，长线模型的财务部分因此<b>未经本检验</b>。样本池为当前扫描入选股（非历史全市场成分），存在选择与幸存者偏差；IC 是统计相关性，不等于可实现收益，也不含交易成本。</p>' +
+    cfg + '</section>';
+}
+
 function renderStrategy() {
   $('#list').innerHTML = '<div class="art">' +
     '<section><h3>工具说明 <em>WHAT IT DOES</em></h3>' +
@@ -5966,6 +6197,7 @@ function renderStrategy() {
       '<p>仅展示 <b>≥50 分</b> 的标的，并与「形态胜率」一起呈现。适合：3–5 个交易日持有，严格执行止损与时间止损。</p></section>' +
     buildBacktestHTML() +
     buildLongBacktestHTML() +
+    buildFactorLabHTML() +
     '<section><h3>交易策略 <em>HOW TO TRADE</em></h3>' +
       '<div class="kv"><span>资金分层</span><b>核心 60% / 卫星 25% / 现金 15%</b></div>' +
       '<p><b>① 核心仓（长线，60%）</b>：只买长线评分 <b>≥70</b> 且道氏结构向上的标的，按 ATR 单位（1% 风险）建仓，单票不超过 20%。持有 6–18 个月，只按「周线 MACD 死叉」或「跌破年线」离场，不做日内波动博弈。</p>' +
@@ -6053,6 +6285,27 @@ function renderStrategy() {
     state.longBacktest = null;
     state.longBtTs = 0;
     localStorage.removeItem('qr_long_backtest_v2');
+    renderStrategy();
+  };
+
+  /* 因子有效性检验 */
+  const rfb = $('#runFactorBtn');
+  if (rfb) rfb.onclick = () => {
+    rfb.disabled = true;
+    rfb.textContent = '检验中…';
+    setTimeout(() => {
+      try {
+        state.factorLab = null;
+        factorLab();
+      } catch (e) {
+        state.factorLab = { insufficient: true, reason: '检验失败：' + (e && e.message ? e.message : e) };
+      }
+      setTimeout(renderStrategy, 30);
+    }, 30);
+  };
+  const cfb = $('#clearFactorBtn');
+  if (cfb) cfb.onclick = () => {
+    state.factorLab = null;
     renderStrategy();
   };
 }
