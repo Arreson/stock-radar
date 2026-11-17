@@ -1,6 +1,6 @@
 /* 应用外壳缓存：离线也能打开界面（行情数据仍需联网） */
-const CACHE = 'qr-shell-v47';
-const ASSETS = ['./stock-radar.html', './manifest.json', './icon-192.png', './icon-512.png'];
+const CACHE = 'qr-shell-v48';
+const ASSETS = ['./stock-radar.html', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(

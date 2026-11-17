@@ -49,6 +49,7 @@ body{
 body[data-tab="short"]{--accent:var(--cyan)}
 body[data-tab="review"]{--accent:var(--gold)}
 body[data-tab="auction"]{--accent:#ff7a45}
+body[data-tab="vol"]{--accent:#ff9f43}
 body[data-tab="watch"]{--accent:var(--purple)}
 body[data-tab="strategy"]{--accent:var(--gold)}
 button,input,select{font:inherit;color:inherit}
@@ -443,9 +444,11 @@ canvas.chart{width:100%;display:block;border-radius:9px;background:rgba(255,255,
 <div id="finTip" class="fin-tip"></div>
 
 <nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="long">长期持有</button>
-  <button class="tab" data-tab="short">短线机会</button>
-  <button class="tab" data-tab="review">盘后复盘</button>
+  <button class="tab active" data-tab="long">长线</button>
+  <button class="tab" data-tab="short">短线</button>
+  <button class="tab" data-tab="auction">竞价</button>
+  <button class="tab" data-tab="vol">放量</button>
+  <button class="tab" data-tab="review">复盘</button>
   <button class="tab" data-tab="watch">自选</button>
   <button class="tab" data-tab="strategy">策略</button>
 </nav>
@@ -515,7 +518,10 @@ const state = {
   btCost: 0.3,         /* 回测双边成本（%） */
   btRange: null,       /* 回测样本区间 [起始日期, 结束日期] */
   showChan: true,      /* 详情图是否叠加缠论结构（笔/中枢） */
-  closeCache: { date: '', volratio: {} }  /* 按日缓存收盘时量比，闭市后复用（避免实时量比归零导致短线列表为空） */
+  hot: null,           /* 热门板块：{date, rows, list}，全市场快照按行业聚合涨幅榜，随缓存持久化 */
+  hotSrc: null,        /* 热门板块口径：market=全市场快照 / sample=样本内降级 / none=不过滤 */
+  hotDays: 1,          /* 热门板块均值使用的交易日数（1 或 2–3） */
+  hotHist: null        /* 每日行业涨幅快照（本地累积，用于近 3 日均值） */
 };
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -1406,6 +1412,351 @@ function scoreShort(x, ctx) {
     nextDay: nextDayForecast(x, ctx, setup),
     plan: shortPlan(x, { marketDown, marketUp, setup })
   };
+}
+
+/* —— 短线 J 阈值（高敏感参数，集中在此便于调整与复盘）——
+   熊市（上证在 MA20 下方）J≥80 视为超买；牛市放宽到 <100，只剔除高位钝化。 */
+const SHORT_J_MAX_BEAR = 80;
+const SHORT_J_MAX_BULL = 100;
+function shortJMax() { return state.marketUp === false ? SHORT_J_MAX_BEAR : SHORT_J_MAX_BULL; }
+
+/* 盘中已交易分钟折算：把「当日累计量」换算成全天等价值，
+   使日线口径与腾讯分钟归一量比语义一致（9:30–11:30 / 13:00–15:00）。 */
+function intradayVolScale() {
+  if (!marketOpen()) return 1;
+  const d = new Date();
+  const hm = d.getHours() * 60 + d.getMinutes();
+  let mins;
+  if (hm <= 570) mins = 1;                        /* 集合竞价 9:15–9:30 */
+  else if (hm <= 690) mins = hm - 570;            /* 上午 9:30–11:30 */
+  else if (hm <= 780) mins = 120;                 /* 午休 */
+  else mins = 120 + (hm - 780);                   /* 下午 13:00–15:00 */
+  mins = Math.max(1, Math.min(230, mins));
+  return 240 / mins;
+}
+
+/* 量比统一口径：
+   1) 腾讯实时量比（field 49，已按分钟对 5 日同时段归一）优先；
+   2) 缺失或闭市归零时，用日线「当日量 / 前 5 日均量」（盘中折算到全天）。
+   分母取 5 日均线的前一根（不含当日），避免当日成交污染基准。
+   用于「放量精选」池过滤与打分，不参与长线/短线策略评分。 */
+function volRatioOf(x) {
+  if (isNum(x.volratio) && x.volratio > 0) return x.volratio;
+  const I = x.ind;
+  if (!I) return null;
+  const v = last(I.v);
+  const arr5 = I.vol5;
+  const base = arr5 && arr5.length > 1 ? arr5[arr5.length - 2] : null;   /* 截至昨日的 5 日均量 */
+  if (isNum(v) && isNum(base) && base > 0) return (v / base) * intradayVolScale();
+  if (isNum(v) && isNum(last(I.vol20)) && last(I.vol20) > 0) return (v / last(I.vol20)) * intradayVolScale();
+  return null;
+}
+
+/* 放量精选评分：综合所有「放量」（量比≥1.2）的股票，按多维度打分推选。
+   维度：量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度（满分 100）。
+   ★ 此分数为「分析口径」，未经过样本外回测验证，不构成收益预测；
+     仅用于在放量股中做相对排序与重点关注，实际交易请叠加策略页白名单。 */
+function scoreVol(x, ctx) {
+  const I = x.ind, c = last(I.c);
+  const ma5 = last(I.ma5), ma20 = last(I.ma20);
+  const J = last(I.J), r6 = last(I.r6);
+  const r5 = I.c.length > 6 ? c / I.c[I.c.length - 6] - 1 : 0;
+  const hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
+  const vr = volRatioOf(x) || 1;
+  /* 中期量能也统一为「不含当日」的基准，避免当日成交把分母抬高、低估放量 */
+  const b5 = I.vol5 && I.vol5.length > 1 ? I.vol5[I.vol5.length - 2] : null;
+  const b20 = I.vol20 && I.vol20.length > 1 ? I.vol20[I.vol20.length - 2] : null;
+  const vr5 = isNum(b5) && b5 > 0 ? last(I.v) / b5 : 1;
+  const vr20 = isNum(b20) && b20 > 0 ? last(I.v) / b20 : 1;
+  const aboveMa20 = isNum(ma20) && c > ma20;
+  const gd = goldenDays(I.K, I.D);
+  const amt20 = avgAmt20(I);
+  const pct = isNum(x.pct) ? x.pct : 0;
+  const turn = turnoverOf(x);
+  const lhb = ctx && ctx.lhb && ctx.lhb[x.code] ? ctx.lhb[x.code] : null;
+
+  const parts = [], reasons = [], risks = [];
+
+  /* 1. 量能强度 30 */
+  let v = 0;
+  v += vr >= 3 ? 16 : vr >= 2 ? 13 : vr >= 1.5 ? 9 : vr >= 1.2 ? 5 : 0;
+  v += vr20 >= 2 ? 8 : vr20 >= 1.5 ? 6 : vr20 >= 1.2 ? 4 : vr20 >= 1.0 ? 2 : 0;
+  if (I.brkVol >= 2.0) v += 6; else if (I.brkVol >= 1.5) v += 4;
+  parts.push({ k: '量能强度', v: clamp(v, 0, 30), max: 30 });
+
+  /* 2. 价格动能 25 */
+  v = 0;
+  v += pct >= 7 ? 10 : pct >= 5 ? 8 : pct >= 3 ? 6 : pct >= 1 ? 4 : pct > 0 ? 2 : 0;
+  if (r6 >= 50 && r6 <= 80) v += 5; else if (r6 > 0) v += 2;
+  v += r5 > 0.10 ? 5 : r5 > 0 ? 3 : 0;
+  if (I.gapTrend > 0) v += 2;
+  parts.push({ k: '价格动能', v: clamp(v, 0, 25), max: 25 });
+
+  /* 3. 形态健康 20 */
+  v = 0;
+  if (aboveMa20) v += 4;
+  if (isNum(ma5) && isNum(ma20) && ma5 > ma20) v += 3;
+  if (gd >= 0 && gd <= 3) v += 3;
+  if (hist > 0) v += 2;
+  if (hist > histPrev) v += 2;
+  if (c >= (last(I.h) + last(I.l)) / 2) v += 2;
+  if (J < 80) v += 4;
+  parts.push({ k: '形态健康', v: clamp(v, 0, 20), max: 20 });
+
+  /* 4. 流动性 15 */
+  v = 0;
+  if (amt20 != null) v += amt20 >= 2e8 ? 6 : amt20 >= 1e8 ? 5 : amt20 >= 5e7 ? 3.5 : amt20 >= 2.5e7 ? 2 : 0;
+  if (turn != null) v += turn >= 8 ? 5 : turn >= 5 ? 4 : turn >= 3 ? 3 : turn >= 1 ? 2 : 0;
+  const atrp = c > 0 ? (last(I.atr) || c * 0.03) / c : 0.03;
+  v += atrp <= 0.05 ? 4 : atrp <= 0.07 ? 2 : 0;
+  parts.push({ k: '流动性', v: clamp(v, 0, 15), max: 15 });
+
+  /* 5. 板块热度 10：放量 + 热门板块共振加分 */
+  v = 0;
+  const hs = hotSet();
+  if (hs && hs[x.sector]) v += 10;
+  if (lhb && lhb.net > 0) { v = Math.min(10, v + 2); reasons.push('龙虎榜净买入 ' + amtTxt(Math.abs(lhb.net) / 1e4)); }
+  parts.push({ k: '板块热度', v: clamp(v, 0, 10), max: 10 });
+
+  /* —— 扣分项（追高 / 过热 / 量价背离）—— */
+  let pen = 0;
+  if (r6 > 85) { pen += 8; risks.push('RSI(6) 超买 ' + fmt(r6, 0)); }
+  if (J > 110) { pen += 6; risks.push('KDJ-J 高位钝化 ' + fmt(J, 0)); }
+  if (isNum(ma20) && c / ma20 - 1 > 0.15) { pen += 6; risks.push('偏离 20 日线 ' + yr((c / ma20 - 1) * 100, 1) + '%'); }
+  if (r5 > 0.30) { pen += 6; risks.push('5 日涨幅 ' + yr(r5 * 100, 1) + '%，注意回吐'); }
+  if (I.volDiverge) { pen += 5; risks.push('量价顶背离'); }
+  if (I.limitStreak >= 2) { pen += 5; risks.push('已连板 ' + I.limitStreak + ' 天，追高风险'); }
+  if (pct < -3) { pen += 4; risks.push('放量下跌 ' + yr(pct, 1) + '%'); }
+
+  const raw = parts.reduce((s, p) => s + p.v, 0) - pen;
+  const score = clamp(raw, 0, 100);
+
+  if (vr >= 2) reasons.push('放量 ' + fmt(vr, 1) + ' 倍');
+  if (pct >= 3) reasons.push('今日 ' + signTxt(pct));
+  if (aboveMa20) reasons.push('站上 20 日线');
+  if (gd >= 0 && gd <= 3) reasons.push('KDJ 金叉');
+  if (amt20 != null && amt20 >= 1e8) reasons.push('成交额 ' + amtTxt(amt20 / 1e4));
+  if (turn != null && turn >= 5) reasons.push('换手 ' + fmt(turn, 1) + '%');
+
+  return { score, parts, vr: +vr.toFixed(2), vr5: +vr5.toFixed(2), vr20: +vr20.toFixed(2), pct, turn,
+    reasons: reasons.slice(0, 5), risks: risks.slice(0, 4) };
+}
+
+/* 放量信号回测验证：不做组合回测，只验证「放量是否带来正期望」这一核心前提，
+   避免把主观权重当成已验证结论。对每只股票每个交易日计算量比（当日量 / 前 5 日均量），
+   按量比分桶统计 T+1 开盘买入、持有 3/5 日（收盘卖出，双边成本 0.3%）的胜率与均收。
+   ⚠ 全样本内统计（同一批股票、未做样本外切分），仅用于方向性验证。 */
+function volValidation() {
+  if (state.volValid && state.volValid.ts === state.ts) return state.volValid;
+  const cost = (state.btCost || 0.3) / 100;
+  const buckets = [
+    { k: '量比<1.2', lo: 0, hi: 1.2 },
+    { k: '1.2–1.5', lo: 1.2, hi: 1.5 },
+    { k: '1.5–2.0', lo: 1.5, hi: 2.0 },
+    { k: '≥2.0', lo: 2.0, hi: Infinity },
+    { k: '全样本', lo: 0, hi: Infinity }
+  ];
+  buckets.forEach(b => { b.n = 0; b.w3 = 0; b.r3 = 0; b.w5 = 0; b.r5 = 0; });
+  const stocks = Object.values(state.data).filter(x => x.bars && x.bars.length > 260);
+  for (const x of stocks) {
+    const bars = x.bars;
+    for (let i = 60; i < bars.length - 6; i++) {
+      let s = 0;
+      for (let j = i - 5; j < i; j++) s += bars[j].v;
+      const base = s / 5;
+      if (!(base > 0)) continue;
+      const vr = bars[i].v / base;
+      const buy = bars[i + 1].o;
+      if (!(buy > 0)) continue;
+      const r3 = bars[i + 4].c / buy - 1 - cost;
+      const r5 = bars[i + 6].c / buy - 1 - cost;
+      for (const b of buckets) {
+        if (vr >= b.lo && vr < b.hi) {
+          b.n++; b.r3 += r3; if (r3 > 0) b.w3++;
+          b.r5 += r5; if (r5 > 0) b.w5++;
+        }
+      }
+    }
+  }
+  const out = buckets.map(b => ({
+    k: b.k, n: b.n,
+    wr3: b.n ? +(b.w3 / b.n * 100).toFixed(1) : null,
+    avg3: b.n ? +(b.r3 / b.n * 100).toFixed(2) : null,
+    wr5: b.n ? +(b.w5 / b.n * 100).toFixed(1) : null,
+    avg5: b.n ? +(b.r5 / b.n * 100).toFixed(2) : null
+  }));
+  state.volValid = { out, ts: state.ts, stocks: stocks.length };
+  return state.volValid;
+}
+
+/* =============== 因子有效性检验（IC / IR / 分层 / 样本外） ===============
+   只检验价量因子：本地没有 point-in-time 财务数据，估值/质量/红利/GARP
+   这类基本面因子无法做历史横截面检验，界面上必须如实说明，不能假装验证过。
+   方法：每 5 个交易日取一个横截面，计算因子值与「未来 5 日收盘收益」的 Spearman
+   秩相关（Rank IC）；按时间前 70% / 后 30% 切分样本内与样本外，规则冻结、不重调参。
+   ⚠ 样本池是当前扫描入选股（非历史全市场成分），存在选择/幸存者偏差。 */
+const FACTOR_DEFS = [
+  { key: 'mom20', name: '20 日动量', dir: '正向', fn: (b, i) => (i >= 20 && b[i - 20].c > 0) ? b[i].c / b[i - 20].c - 1 : null },
+  { key: 'mom60', name: '60 日动量', dir: '正向', fn: (b, i) => (i >= 60 && b[i - 60].c > 0) ? b[i].c / b[i - 60].c - 1 : null },
+  { key: 'rev5', name: '5 日反转', dir: '反向', fn: (b, i) => (i >= 5 && b[i - 5].c > 0) ? b[i].c / b[i - 5].c - 1 : null },
+  { key: 'vol20', name: '20 日波动率', dir: '反向', fn: (b, i) => {
+      if (i < 21) return null;
+      let s = 0, n = 0;
+      for (let j = i - 19; j <= i; j++) {
+        if (b[j - 1].c > 0 && b[j].c > 0) { const r = Math.log(b[j].c / b[j - 1].c); s += r * r; n++; }
+      }
+      return n >= 15 ? Math.sqrt(s / n) : null;
+    } },
+  { key: 'vr5', name: '量比（5 日）', dir: '正向', fn: (b, i) => {
+      if (i < 5) return null;
+      let s = 0;
+      for (let j = i - 5; j < i; j++) s += b[j].v || 0;
+      const base = s / 5;
+      return base > 0 ? (b[i].v || 0) / base : null;
+    } },
+  { key: 'ma20dev', name: '20 日线偏离', dir: '正向', fn: (b, i) => {
+      if (i < 19) return null;
+      let s = 0;
+      for (let j = i - 19; j <= i; j++) s += b[j].c;
+      const ma = s / 20;
+      return ma > 0 ? b[i].c / ma - 1 : null;
+    } },
+  { key: 'amt20', name: '20 日成交额', dir: '正向', fn: (b, i) => {
+      if (i < 19) return null;
+      let s = 0, n = 0;
+      for (let j = i - 19; j <= i; j++) {
+        if (b[j].c > 0 && b[j].v > 0) { s += b[j].c * b[j].v; n++; }
+      }
+      return n >= 10 ? Math.log(s / n) : null;
+    } }
+];
+
+function labRank(arr) {
+  const idx = arr.map((_, i) => i).sort((a, b) => arr[a] - arr[b]);
+  const out = new Array(arr.length);
+  let i = 0;
+  while (i < idx.length) {
+    let j = i;
+    while (j + 1 < idx.length && arr[idx[j + 1]] === arr[idx[i]]) j++;
+    const r = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) out[idx[k]] = r;
+    i = j + 1;
+  }
+  return out;
+}
+
+function labSpearman(a, b) {
+  const n = a.length;
+  if (n < 3) return null;
+  const ra = labRank(a), rb = labRank(b);
+  let sa = 0, sb = 0;
+  for (let i = 0; i < n; i++) { sa += ra[i]; sb += rb[i]; }
+  const ma = sa / n, mb = sb / n;
+  let cov = 0, va = 0, vb = 0;
+  for (let i = 0; i < n; i++) {
+    const da = ra[i] - ma, db = rb[i] - mb;
+    cov += da * db; va += da * da; vb += db * db;
+  }
+  return va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : null;
+}
+
+function labAcc() { return { ics: [], q: [[], [], [], [], []] }; }
+function labPush(acc, ic, qm) {
+  if (!isNum(ic)) return;
+  acc.ics.push(ic);
+  for (let k = 0; k < 5; k++) if (isNum(qm[k])) acc.q[k].push(qm[k]);
+}
+function labSummary(acc) {
+  const ics = acc.ics, n = ics.length;
+  if (n < 2) return { n, meanIc: null, ir: null, t: null, pos: null, q: [null, null, null, null, null], spread: null, mono: 0 };
+  const mean = ics.reduce((s, x) => s + x, 0) / n;
+  const sd = Math.sqrt(ics.reduce((s, x) => s + (x - mean) * (x - mean), 0) / (n - 1));
+  const q = acc.q.map(a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
+  const up = isNum(q[4]) && isNum(q[0]) && q[4] >= q[0];
+  let mono = 0;
+  for (let k = 0; k < 4; k++) {
+    if (isNum(q[k]) && isNum(q[k + 1]) && (q[k + 1] - q[k]) * (up ? 1 : -1) > 0) mono++;
+  }
+  return {
+    n,
+    meanIc: mean,
+    ir: sd > 0 ? mean / sd : null,
+    t: sd > 0 ? mean / (sd / Math.sqrt(n)) : null,
+    pos: ics.filter(x => x > 0).length / n * 100,
+    q,
+    spread: isNum(q[4]) && isNum(q[0]) ? (q[4] - q[0]) * 100 : null,
+    mono
+  };
+}
+
+function factorLab() {
+  if (state.factorLab && state.factorLab.ts === state.ts) return state.factorLab;
+  const stocks = Object.values(state.data).filter(x => x.bars && x.bars.length >= 320);
+  if (stocks.length < 20) return { insufficient: true, reason: '当前样本池不足 20 只（需先完成一次全市场扫描）' };
+
+  const dateSet = new Set();
+  stocks.forEach(x => { for (const b of x.bars) dateSet.add(b.d); });
+  const dates = Array.from(dateSet).sort();
+  const sample = [];
+  for (let i = 70; i < dates.length; i += 5) sample.push(dates[i]);
+  if (sample.length < 60) return { insufficient: true, reason: '可用历史不足 60 个采样点（约 1 年余），样本外检验不成立' };
+  const cutIdx = Math.floor(sample.length * 0.7);
+
+  const idxMap = new Map();
+  stocks.forEach(x => {
+    const m = new Map();
+    x.bars.forEach((b, i) => m.set(b.d, i));
+    idxMap.set(x.code, m);
+  });
+
+  const accs = FACTOR_DEFS.map(() => ({ all: labAcc(), is: labAcc(), oos: labAcc() }));
+  let obs = 0;
+  sample.forEach((d, si) => {
+    const split = si < cutIdx ? 'is' : 'oos';
+    const xs = [];
+    for (const x of stocks) {
+      const i = idxMap.get(x.code).get(d);
+      if (i == null || i + 5 >= x.bars.length) continue;
+      const vals = {}, fwd = x.bars[i + 5].c / x.bars[i].c - 1;
+      if (!isNum(fwd)) continue;
+      let ok = true;
+      for (const f of FACTOR_DEFS) {
+        const v = f.fn(x.bars, i);
+        if (!isNum(v)) { ok = false; break; }
+        vals[f.key] = v;
+      }
+      if (ok) xs.push({ vals, fwd });
+    }
+    if (xs.length < 20) return;
+    obs += xs.length;
+    FACTOR_DEFS.forEach((f, fi) => {
+      const vals = xs.map(o => o.vals[f.key]);
+      const fwds = xs.map(o => o.fwd);
+      const ic = labSpearman(vals, fwds);
+      if (!isNum(ic)) return;
+      const order = vals.map((_, i) => i).sort((a, b) => vals[a] - vals[b]);
+      const qs = [0, 0, 0, 0, 0].map(() => ({ s: 0, n: 0 }));
+      order.forEach((oi, rank) => {
+        const g = Math.min(4, Math.floor(rank / xs.length * 5));
+        qs[g].s += fwds[oi]; qs[g].n++;
+      });
+      const qm = qs.map(q => q.n ? q.s / q.n : null);
+      labPush(accs[fi].all, ic, qm);
+      labPush(accs[fi][split], ic, qm);
+    });
+  });
+  idxMap.clear();
+
+  const factors = FACTOR_DEFS.map((f, fi) => ({
+    key: f.key, name: f.name, dir: f.dir,
+    all: labSummary(accs[fi].all), is: labSummary(accs[fi].is), oos: labSummary(accs[fi].oos)
+  }));
+  state.factorLab = {
+    ts: state.ts, stocks: stocks.length, obs, dates: sample.length,
+    fwdDays: 5, cutDate: sample[cutIdx],
+    isDates: cutIdx, oosDates: sample.length - cutIdx, factors
+  };
+  return state.factorLab;
 }
 
 /* 短线形态基准统计（已按实盘同口径：20 日冷却 + 量比≥1.2 + J<80 过滤）
@@ -2654,7 +3005,7 @@ function scoreAll() {
   if (state.margin && isNum(state.margin.chg5d)) ctx.margin5d = state.margin.chg5d;
   /* 北向十大活跃股（T 日盘后发布，热度信号无方向） */
   if (state.north && state.north.top10) ctx.north10 = state.north.top10;
-  list.forEach(x => { x.long = scoreLong(x, ctx); x.short = scoreShort(x, ctx); });
+  list.forEach(x => { x.long = scoreLong(x, ctx); x.short = scoreShort(x, ctx); x.vol = scoreVol(x, ctx); });
   state.scoredCount = list.length;
 }
 
@@ -2709,12 +3060,6 @@ function parseQt(x) {
   x.mcap = n(45);
   x.amount = n(37);
   x.volratio = n(49);
-  /* 盘中持续记录当日量比到收盘缓存；闭市后不覆盖，保留收盘前最后有效值 */
-  if (marketOpen && marketOpen() && isNum(x.volratio) && x.volratio > 0) {
-    const today = shToday();
-    if (state.closeCache.date !== today) state.closeCache = { date: today, volratio: {} };
-    state.closeCache.volratio[x.code] = x.volratio;
-  }
 }
 
 function buildEntry(meta, raw) {
@@ -3587,20 +3932,6 @@ function loadLimitStats() {
 }
 function saveLimitStats() { try { localStorage.setItem(LIMIT_STATS_KEY, JSON.stringify(state.limitStats)); } catch (e) {} }
 
-/* 收盘量比缓存：盘中每次报价刷新都写入当日量比；闭市后腾讯实时量比会归零/失真，
-   短线「量比≥1.2」过滤需复用收盘前的量比，否则列表会变空。按日轮转，次日自动清空。 */
-const CLOSE_CACHE_KEY = 'qr_closecache_v1';
-function loadCloseCache() {
-  try {
-    const j = JSON.parse(localStorage.getItem(CLOSE_CACHE_KEY) || 'null');
-    if (j && j.date && j.volratio) {
-      const today = shToday();
-      state.closeCache = (j.date === today) ? j : { date: today, volratio: {} };
-    }
-  } catch (e) {}
-}
-function saveCloseCache() { try { localStorage.setItem(CLOSE_CACHE_KEY, JSON.stringify(state.closeCache)); } catch (e) {} }
-
 function computeLimitUpStats() {
   const t0 = Date.now();
   /* 格：gap 4 桶 × vr 3 桶；hist 组合 5 项；10cm / 20cm 分池 */
@@ -3852,17 +4183,20 @@ async function runAuctionScan() {
     .sort((a, b) => b.score - a.score || b.amtYi - a.amtYi);
   const phase = auctionPhase();
   const today = dayStr(new Date());
-  state.auction.rows = scored.slice(0, 20);
+  /* 竞价推荐同样只从热门板块中筛选（盘前/竞价时用最近交易日的热门榜） */
+  const hs = hotSet();
+  state.auction.rows = (hs ? scored.filter(r => hs[r.ind]) : scored).slice(0, 20);
   state.auction.ts = Date.now();
   state.auction.date = today;
   state.auction.phase = phase;
   /* 9:25 后定格当日结果，不再自动刷新；开盘后拉取为实时快照，标注口径差异 */
   state.auction.frozen = phase === 'frozen' || phase === 'open';
-  state.auction.msg = phase === 'open'
+  state.auction.msg = (phase === 'open'
     ? '已开盘 · 以下为实时行情快照（非当日 9:25 定格竞价数据，竞价评分仅供参考）'
     : phase === 'frozen' ? '9:25 定格 · 以下为今日竞价推荐'
     : phase === 'before' ? '盘前实时快照（竞价尚未开始，9:15 后口径更准确）'
-    : '竞价中 · 每 10 秒刷新（9:25 前可撤单，数据仅供参考）';
+    : '竞价中 · 每 10 秒刷新（9:25 前可撤单，数据仅供参考）') +
+    (hs ? ' · 已按热门板块过滤' : '');
   saveAuction();
   paintAuction();
 }
@@ -3917,6 +4251,93 @@ function normalizeMarket(rows, todayStr) {
     });
   }
   return out;
+}
+
+/* 热门板块：全市场快照按行业（东财二级）聚合，等权平均涨幅排名，取前 HOT_SECTOR_N。
+   仅作为推荐过滤层，不参与评分/排序；涨停家数与成交额用于展示。 */
+const HOT_SECTOR_N = 30;   /* 全市场约 86 个二级行业，前 30 ≈ 前 1/3 */
+function computeHotSectors(norm, date) {
+  const agg = {};
+  for (const r of norm) {
+    if (!r.ind) continue;
+    const a = agg[r.ind] || (agg[r.ind] = { n: 0, pctSum: 0, amount: 0, lu: 0 });
+    a.n++; a.pctSum += r.pct || 0; a.amount += r.amount || 0;
+    if (r.pct >= 9.8) a.lu++;
+  }
+  const rows = Object.keys(agg).map(k => ({
+    sector: k, n: agg[k].n, avgPct: +(agg[k].pctSum / agg[k].n).toFixed(2),
+    amount: agg[k].amount, lu: agg[k].lu
+  })).filter(r => r.n >= 5);
+  rows.sort((a, b) => b.avgPct - a.avgPct || b.amount - a.amount);
+  if (!rows.length) return null;
+  /* 返回完整排行（不截断），便于后续做「近 3 日均值」；展示/过滤时再取前 N */
+  return { date, rows, list: rows.slice(0, HOT_SECTOR_N).map(r => r.sector) };
+}
+
+/* 每日行业涨幅快照本地累积（用于近 3 日均值，降低单日噪声） */
+const HOT_HIST_KEY = 'qr_hot_hist_v1';
+function recordHotHistory(hot) {
+  if (!hot || !hot.rows || !hot.rows.length) return;
+  let h = {};
+  try { h = JSON.parse(localStorage.getItem(HOT_HIST_KEY) || '{}') || {}; } catch (e) { h = {}; }
+  const rec = {};
+  hot.rows.forEach(r => { rec[r.sector] = r.avgPct; });
+  h[hot.date] = rec;
+  const ds = Object.keys(h).sort();
+  while (ds.length > 10) delete h[ds.shift()];
+  try { localStorage.setItem(HOT_HIST_KEY, JSON.stringify(h)); } catch (e) {}
+  state.hotHist = h;
+}
+
+/* 热门板块有效榜：近 3 个交易日行业涨幅均值；历史不足 2 日时退回当日榜。
+   只在当日出现的行业范围内排序，避免无当日数据的陈旧行业混入。 */
+function hotRowsEffective() {
+  const hot = state.hot;
+  if (!hot || !hot.rows || !hot.rows.length) return null;
+  let h = state.hotHist;
+  if (!h) {
+    try { h = JSON.parse(localStorage.getItem(HOT_HIST_KEY) || '{}') || {}; } catch (e) { h = {}; }
+    state.hotHist = h;
+  }
+  const ds = Object.keys(h).sort().slice(-3);
+  if (ds.length < 2) { state.hotDays = 1; return hot.rows.map(r => ({ ...r, days: 1 })); }
+  const acc = {};
+  ds.forEach(d => Object.keys(h[d]).forEach(s => {
+    if (!isNum(h[d][s])) return;
+    const a = acc[s] || (acc[s] = { sum: 0, n: 0 });
+    a.sum += h[d][s]; a.n++;
+  }));
+  const out = hot.rows.map(r => {
+    const a = acc[r.sector];
+    const avg = a && a.n ? a.sum / a.n : r.avgPct;
+    return { ...r, avgPct: +avg.toFixed(2), days: a ? a.n : 1 };
+  }).sort((x, y) => y.avgPct - x.avgPct || y.amount - x.amount);
+  state.hotDays = ds.length;
+  return out;
+}
+
+/* 推荐过滤用的热门板块查找表：优先全市场快照口径；无快照（旧缓存/快照失败）时退化为
+   当前扫描池内板块均值 Top5（口径较弱，仅兜底）；都没有返回 null（不过滤，避免空列表） */
+function hotSet() {
+  const eff = hotRowsEffective();
+  if (eff && eff.length) {
+    state.hotSrc = 'market';
+    const m = {};
+    eff.slice(0, HOT_SECTOR_N).forEach(r => { m[r.sector] = 1; });
+    return m;
+  }
+  const agg = {};
+  for (const x of Object.values(state.data)) {
+    if (!x.sector || !isNum(x.pct)) continue;
+    const a = agg[x.sector] || (agg[x.sector] = { n: 0, s: 0 });
+    a.n++; a.s += x.pct;
+  }
+  const rows = Object.keys(agg).filter(k => agg[k].n >= 3)
+    .map(k => ({ s: k, p: agg[k].s / agg[k].n }))
+    .sort((a, b) => b.p - a.p).slice(0, 5);
+  state.hotSrc = rows.length ? 'sample' : 'none';
+  if (!rows.length) return null;
+  const m = {}; rows.forEach(r => { m[r.s] = 1; }); return m;
 }
 
 /* 初筛：50% 按成交额（可交易性），30% 按 60 日正动量，20% 按最大回撤（超卖反弹候选）
@@ -4003,6 +4424,9 @@ async function refreshFull(opts) {
       down5: norm.filter(r => r.pct <= -5).length,
       total: norm.length
     };
+    /* 热门板块榜：全市场行业排名（近 3 日均值优先），推荐只从这些板块中筛选 */
+    state.hot = computeHotSectors(norm, shToday());
+    if (state.hot) recordHotHistory(state.hot);
     metas = prescreen(norm, COVER_N);
     if (metas.length < 40) throw new Error('初筛候选不足');
     $('#loadStatus').textContent = '全市场 ' + (ml.total || norm.length) + ' 只 · 初筛 ' + metas.length + ' 只';
@@ -4067,7 +4491,6 @@ async function refreshFull(opts) {
     const dates = Object.values(nd).map(x => x.lastDate).filter(Boolean).sort();
     state.lastDate = dates[dates.length - 1] || '';
     saveCache();
-    saveCloseCache();
     showSync(false);
     showOverlay(false);
     render();
@@ -4165,7 +4588,6 @@ async function quickQuote(silent) {
     if (dates.length) state.lastDate = dates[dates.length - 1];
     state.hasCache = true;
     saveCache();
-    saveCloseCache();
     render();
     if (!silent) toast('报价已更新 · ' + ok + ' 只', 1800);
   }
@@ -4239,6 +4661,7 @@ function saveCache() {
   const pack = {
     v: 6, ts: Date.now(), lastDate: state.lastDate,
     marketTotal: state.marketTotal, coverN: state.coverN,
+    hot: state.hot,
     meta: {}, data: {}, idx: {}
   };
   for (const k of Object.keys(state.data)) {
@@ -4273,6 +4696,8 @@ function applyCache(pack) {
   state.meta = pack.meta || {};
   state.marketTotal = pack.marketTotal || 0;
   state.coverN = pack.coverN || 0;
+  state.hot = pack.hot || null;
+  if (state.hot) recordHotHistory(state.hot);
   state.data = {};
   for (const code of Object.keys(pack.data)) {
     const raw = pack.data[code];
@@ -4398,6 +4823,7 @@ async function ensureWatchStock(code) {
     }
     x.long = scoreLong(x, ctx);
     x.short = scoreShort(x, ctx);
+    x.vol = scoreVol(x, ctx);
   } catch (e) {
     console.warn('[ensureWatch] analyze/score 失败', code, e.message);
     return null;
@@ -4425,8 +4851,7 @@ async function ensureAllWatch() {
   await Promise.all(codes.map(c => ensureWatchStock(c)));
   /* 拉完触发 renderWatch（如果当前 Tab 是 watch）或 renderList */
   if (state.tab === 'watch') renderWatch();
-  else if (state.tab === 'short') { if (showAuctionFirst()) renderAuction(); else renderList(); }
-  else if (state.tab === 'long') renderList();
+  else if (state.tab === 'long' || state.tab === 'short' || state.tab === 'vol') renderList();
   else if (state.tab === 'review') renderReview();
 }
 
@@ -4683,11 +5108,15 @@ function renderIndustryRow() {
   list.forEach(x => { if (x.sector) cnt[x.sector] = (cnt[x.sector] || 0) + 1; });
   const sectors = Object.keys(cnt).filter(s => cnt[s] >= 4)
     .sort((a, b) => cnt[b] - cnt[a]).slice(0, 22);
-  const sig = sectors.join('|');
+  const hs = hotSet();
+  const hotMark = s => (hs && hs[s]) ? '1' : '0';
+  const sig = sectors.map(s => s + hotMark(s)).join('|');   /* 热度变化也要重建 chips */
   if (row.dataset.sig !== sig) {
     if (state.ind !== '全部' && sectors.indexOf(state.ind) < 0) state.ind = '全部';
     row.innerHTML = ['全部'].concat(sectors).map(i =>
-      '<button class="fchip' + (i === state.ind ? ' active' : '') + '" data-ind="' + i + '">' + i + '</button>'
+      '<button class="fchip' + (i === state.ind ? ' active' : '') + '" data-ind="' + i + '"' +
+      (hs && hs[i] ? ' title="今日热门板块（全市场行业涨幅前' + HOT_SECTOR_N + '）"' : '') + '>' +
+      (hs && hs[i] ? '🔥' : '') + i + '</button>'
     ).join('');
     row.dataset.sig = sig;
     return;
@@ -4714,18 +5143,29 @@ function diversify(arr) {
 }
 
 function sortedList(mode) {
-  let arr = Object.values(state.data).filter(x => x.long && x.short);
+  let arr = Object.values(state.data).filter(x => x.long && x.short && (mode !== 'vol' || x.vol));
   arr = arr.filter(x => matchQuery(x, state.search) && (state.ind === '全部' || x.sector === state.ind));
-  /* 短线排序键 = 执行分（风控口径，非收益预测）；综合分已因未通过样本外验证退出排序 */
-  arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score : (b.short.exec || 0) - (a.short.exec || 0));
+  /* 放量池：只取量比≥1.2 的股票（综合所有放量股） */
+  if (mode === 'vol') arr = arr.filter(x => { const vr = volRatioOf(x); return isNum(vr) && vr >= 1.2; });
+  /* 热门板块过滤：只在默认推荐视图生效（推荐只出自热门板块）；
+     长线 ≥75 分的高质量股豁免（震荡市不挡高分冷门股）；
+     用户手动选行业/搜索时尊重其选择，不再叠加 */
+  if (!state.search && state.ind === '全部') {
+    const hs = hotSet();
+    if (hs) arr = arr.filter(x => hs[x.sector] || (mode === 'long' && x.long.score >= 75));
+  }
+  /* 排序：长线=长线评分，短线=执行分，放量=放量评分 */
+  arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score
+    : mode === 'vol' ? (b.vol.score || 0) - (a.vol.score || 0)
+    : (b.short.exec || 0) - (a.short.exec || 0));
   return arr;
 }
 
-function scoreMode(mode) { return mode === 'short' ? 'short' : 'long'; }
+function scoreMode(mode) { return mode === 'short' ? 'short' : mode === 'vol' ? 'vol' : 'long'; }
 
 function cardHTML(x, mode, rank) {
   const m = scoreMode(mode);
-  const s = m === 'short' ? x.short : x.long;
+  const s = m === 'short' ? x.short : m === 'vol' ? x.vol : x.long;
   const score = m === 'short' ? (s.exec || 0) : s.score;   /* 短线环显执行分 */
   const pctCls = x.pct >= 0 ? 'up' : 'down';
   const reasons = s.reasons.slice(0, 4);
@@ -4758,10 +5198,12 @@ function cardHTML(x, mode, rank) {
     const ndColor = nd.prob >= 55 ? 'var(--green)' : nd.prob >= 50 ? 'var(--yellow)' : 'var(--red)';
     nextDayMark = '<em style="color:' + ndColor + ';font-weight:600" title="次日收阳概率（12年实测条件概率）">次日↑' + nd.prob.toFixed(0) + '%</em>';
   }
-  /* 竞价 × 短线合并：若该票出现在今日竞价 Top20，标注竞价涨幅（仅标注，不影响评分/过滤） */
-  const au = m === 'short' ? auctionHit(x.code) : null;
-  const auMark = au ? '<em style="color:var(--cyan)">竞价' + signTxt(au.pct) + '</em>' : '';
-  const footExtra = bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark + (nextDayMark && auMark ? ' ' : '') + auMark;
+  /* 长线高分豁免标记：不在热门板块但 ≥75 分被保留的标的（仅标注，不影响评分） */
+  const exemptMark = (m === 'long' && !state.search && state.ind === '全部') ? (() => {
+    const hs = hotSet();
+    return (hs && !hs[x.sector] && x.long.score >= 75) ? '<em style="color:var(--gold);font-weight:600">高分豁免</em> ' : '';
+  })() : '';
+  const footExtra = exemptMark + bearGoldMark + (bearGoldMark && (aShareMark || regimeMark || minuteMark) ? ' ' : '') + aShareMark + (aShareMark && (regimeMark || minuteMark) ? ' ' : '') + regimeMark + (regimeMark && minuteMark ? ' ' : '') + minuteMark + (minuteMark && nextDayMark ? ' ' : '') + nextDayMark;
   const footShort = '执行 ' + Math.round(s.exec || 0) + ' · ' + (s.pool === 'oversold' ? '超跌观察池·' : '') + (s.setupName || '') +
     ' · 量比 ' + (isNum(s.vr5) ? fmt(s.vr5, 1) : '—') + ' / J ' + (isNum(s.jv) ? fmt(s.jv, 0) : '—') +
     (s.winRate3 != null && s.winRate != null
@@ -4770,6 +5212,9 @@ function cardHTML(x, mode, rank) {
     ' · 5日均 ' + (s.avgRet != null ? (s.avgRet >= 0 ? '+' : '') + s.avgRet.toFixed(2) + '%' : '—');
   const footLong = '长线 ' + fmt(score, 1) + ' · ' + (s.sleeveName ? s.sleeveName + ' sleeve' : '质量/估值/红利') +
     (s.finMissing ? ' · 基本面待补齐' : '');
+  const footVol = '放量 ' + fmt(score, 0) + ' · 量比 ' + (isNum(s.vr) ? fmt(s.vr, 2) : '—') +
+    ' · 涨幅 ' + (isNum(s.pct) ? signTxt(s.pct) : '—') +
+    (isNum(s.turn) ? ' · 换手 ' + fmt(s.turn, 1) + '%' : '');
   /* 观察标签：只展示，不计分、不过滤、不进推荐（与 reasons 严格分开，避免被当成入选理由） */
   const obsMark = (m === 'short' && s.obsTags && s.obsTags.length)
     ? s.obsTags.map(t => '<span class="chip" style="border-style:dashed;border-color:var(--muted);color:var(--muted);background:transparent" title="观察标签：仅展示，不计分/不过滤/不进推荐。500只样本同口径回测：3日胜率57.6%、均收+1.66%（n=203）；样本外44.4%/+0.53%（n=27），未达统计显著">' + t + '</span>').join('')
@@ -4785,13 +5230,13 @@ function cardHTML(x, mode, rank) {
     '</div>' +
     '<div class="chips">' + reasons.map((r, i) => '<span class="chip ' + (i === 0 ? chipCls : '') + '">' + r + '</span>').join('') + obsMark + (minute && minute.score && minute.score.notes ? minute.score.notes.slice(0, 2).map(n => '<span class="chip" style="border-color:var(--cyan);color:var(--cyan)">' + n + '</span>').join('') : '') + '</div>' +
     '<canvas class="spark" data-code="' + x.code + '"></canvas>' +
-    '<div class="card-foot"><span>' + (m === 'short' ? footShort : footLong) + '</span><span class="go">' + footExtra + ' 查看详情 ›</span></div>' +
+    '<div class="card-foot"><span>' + (m === 'short' ? footShort : m === 'vol' ? footVol : footLong) + '</span><span class="go">' + footExtra + ' 查看详情 ›</span></div>' +
     '</article>';
 }
 
 function rowHTML(x, mode, rank) {
   const m = scoreMode(mode);
-  const score = m === 'short' ? (x.short.exec || 0) : x.long.score;
+  const score = m === 'short' ? (x.short.exec || 0) : m === 'vol' ? (x.vol.score || 0) : x.long.score;
   const pctCls = x.pct >= 0 ? 'up' : 'down';
   return '<div class="row" data-code="' + x.code + '">' +
     '<span class="rk num">' + rank + '</span>' +
@@ -4801,9 +5246,21 @@ function rowHTML(x, mode, rank) {
     '<span class="rp num ' + pctCls + '">' + signTxt(x.pct) + '</span></div>';
 }
 
+/* 数据源健康度：辅助数据（热点快照/龙虎榜/北向/涨停统计）缺失时提示，
+   让「今天没信号」和「数据没拿到」在界面上可区分，避免静默降级误导。 */
+function dataHealthBar() {
+  const miss = [];
+  if (!(state.hot && state.hot.rows && state.hot.rows.length)) miss.push('全市场快照');
+  if (!(state.lhb && state.lhb.date)) miss.push('龙虎榜');
+  if (!(state.north && state.north.date)) miss.push('北向');
+  if (!(state.limitStats && state.limitStats.cells)) miss.push('涨停统计');
+  if (!miss.length) return '';
+  return '<div class="notice" style="font-size:11px;padding:6px 10px;opacity:.85">🩺 <b>数据源</b>：本次未获取 ' +
+    miss.join(' / ') + '，对应加权未生效（基础评分不受影响）。</div>';
+}
+
 function renderList() {
-  const mode = state.tab === 'short' ? 'short' : 'long';
-  state.auctionView = false;
+  const mode = state.tab === 'short' ? 'short' : state.tab === 'vol' ? 'vol' : 'long';
   renderIndustryRow();
   const arr = sortedList(mode);
   const head = $('#list');
@@ -4812,19 +5269,26 @@ function renderList() {
     return;
   }
   if (!arr.length) {
-    head.innerHTML = '<div class="empty"><div class="ico">⌕</div><p>没有匹配的标的</p><p>试试更换行业或清空搜索词</p></div>';
+    const hotMode = !state.search && state.ind === '全部' && hotSet();
+    head.innerHTML = '<div class="empty"><div class="ico">⌕</div><p>没有匹配的标的</p><p>' +
+      (hotMode ? '今日热门板块内暂无符合策略条件的标的，可手动选择行业查看' : '试试更换行业或清空搜索词') +
+      '</p></div>';
     return;
   }
   const div = diversify(arr);
   /* 长线仅展示高分精选（>=70 分经回测验证为正收益区间）；短线过白名单 + 冷却期 */
   const today = shToday();
   let filtered;
+  let coolMap = null;   /* 短线冷却期：只在最终展示后写入，避免未上榜标的被误冻结 */
   if (mode === 'long') {
     filtered = div.filter(x => x.long.score >= 70);
     if (!filtered.length) filtered = div;
+  } else if (mode === 'vol') {
+    /* 放量精选：分析口径，不设分数门槛，展示去重后的全部放量股 */
+    filtered = div;
   } else {
     /* 读取冷却期记录（本地持久化） */
-    let coolMap = {};
+    coolMap = {};
     try { coolMap = JSON.parse(localStorage.getItem('qr_short_cooldown') || '{}'); } catch (e) {}
     const cutoff = dayStr(new Date(Date.UTC(+today.slice(0, 4), +today.slice(5, 7) - 1, +today.slice(8, 10)) - SHORT_COOLDOWN_DAYS * 86400000));
     /* 自适应白名单：牛市 bull20 / 熊市 bear20 选最优形态 */
@@ -4833,16 +5297,12 @@ function renderList() {
        3 日胜率 48.8%→52.1%、5 日 48.9%→52.3%，均收 0.41%→1.02% / 0.70%→1.02%
        9/12 年跑赢基线（2015 样本少、2023 例外）。覆盖率约 16%，属"精选"而非全市场铺开 */
     const volOK = x => {
-      /* 闭市后腾讯实时量比会归零/失真，优先复用收盘前缓存的量比 */
-      const closed = !marketOpen();
-      const cached = closed && state.closeCache.date === today ? state.closeCache.volratio[x.code] : null;
-      const vr = (isNum(cached) && cached > 0) ? cached : x.volratio;
-      if (isNum(vr) && vr > 0) return vr >= 1.2;                          /* 腾讯实时量比（已按分钟归一） */
-      const I = x.ind;
-      if (!I) return true;
-      const v20 = last(I.vol20);
-      if (isNum(v20) && v20 > 0) return last(I.v) / v20 >= 1.2;          /* 回落：当日量/20日均量 */
-      return true;
+      /* 统一量比口径：腾讯实时量比（分钟归一）优先；缺失/闭市归零时用
+         日线「当日量 / 前 5 日均量」（盘中按已交易分钟折算到全天）。
+         两种来源语义一致，不再出现同阈值不同含义的问题。 */
+      const vr = volRatioOf(x);
+      if (!isNum(vr)) return true;          /* 数据缺失不拦（避免整池清空） */
+      return vr >= 1.2;
     };
     filtered = div.filter(x => {
       const sk = x.short && x.short.setup;
@@ -4855,11 +5315,12 @@ function renderList() {
       /* 综合分门槛已移除：未通过样本外验证的分数不作为过滤条件（诚实口径） */
       if (!volOK(x)) return false;
       const J = x.ind ? last(x.ind.J) : NaN;
-      if (isFinite(J) && J >= 80) return false;                           /* J>80 超买，次日回落概率高 */
-      coolMap[x.code] = today;                                            /* 仅通过的信号才计入冷却期 */
+      /* J 阈值随市场环境自适应（常量见顶部 SHORT_J_MAX_*）：
+         - 熊市：J≥80 视为超买，次日回落概率高，保持 <80 严格过滤；
+         - 牛市：突破/趋势延续形态天然伴随高 J，放宽到 <100，只剔除高位钝化。 */
+      if (isFinite(J) && J >= shortJMax()) return false;
       return true;
     });
-    try { localStorage.setItem('qr_short_cooldown', JSON.stringify(coolMap)); } catch (e) {}
     /* 无信号时不放宽条件（旧逻辑会绕过白名单/冷却，把低质量标的混进推荐） */
   }
 
@@ -4898,16 +5359,61 @@ function renderList() {
   const oversoldX = mode === 'short' ? filtered.filter(x => x.short && x.short.pool === 'oversold') : [];
   const mainArr = mode === 'short' ? filtered.filter(x => !(x.short && x.short.pool === 'oversold')) : filtered;
   const cards = mainArr.slice(0, 8);
+  /* 冷却期只记录真正进入推荐卡片的标的。
+     此前在过滤阶段就写入，导致被「同行业最多 2 只」或卡片截断剔除、
+     用户从未看到的标的也被冻结 20 天。 */
+  if (mode === 'short' && coolMap) {
+    cards.forEach(x => { coolMap[x.code] = today; });
+    try { localStorage.setItem('qr_short_cooldown', JSON.stringify(coolMap)); } catch (e) {}
+  }
   const cardCodes = new Set(cards.map(c => c.code));
   const rest = arr.filter(x => !cardCodes.has(x.code) && !oversoldX.some(o => o.code === x.code));
-  const title = state.search ? '搜索结果' : state.ind !== '全部' ? state.ind + ' · 行业筛选' : mode === 'long' ? '今日长线精选' : '今日短线机会';
+  const title = state.search ? '搜索结果' : state.ind !== '全部' ? state.ind + ' · 行业筛选' : mode === 'long' ? '今日长线精选' : mode === 'vol' ? '今日放量精选' : '今日短线机会';
   const note = ((state.search || state.ind !== '全部') ? '共 ' + arr.length + ' 只'
       : mode === 'short' ? ('主池 ' + mainArr.length + ' 只 · 超跌池 ' + oversoldX.length + ' 只')
+      : mode === 'vol' ? ('放量股 ' + arr.length + ' 只 · 量比≥1.2 · 同行业最多2只')
       : cards.length + ' 只精选 · 同行业最多2只') +
     (mode === 'short' && arr.length >= 20 ? ' · 分位基于当前 ' + arr.length + ' 只扫描池' : '');
   let html = '<div class="sec"><b>' + title + '</b><span>' + note + '</span></div>' + shapeBar;
+  /* 热门板块提示条：默认推荐视图下展示热门板块榜，推荐只从这些板块中筛选 */
+  const hotEff = hotRowsEffective();
+  if (!state.search && state.ind === '全部' && ((hotEff && hotEff.length) || state.hotSrc === 'sample')) {
+    const top = (hotEff || []).slice(0, 6)
+      .map(r => r.sector + ' <b class="' + (r.avgPct >= 0 ? 'up' : 'down') + '">' + (r.avgPct >= 0 ? '+' : '') + r.avgPct + '%</b>')
+      .join(' · ');
+    const days = state.hotDays || 1;
+    const rangeTxt = days >= 2 ? ('近 ' + days + ' 日行业涨幅均值') : '当日全市场行业涨幅';
+    const degraded = state.hotSrc === 'sample';
+    html += '<div class="notice" style="font-size:11px;padding:6px 10px">🔥 ' +
+      (degraded
+        ? '<b>热门板块已降级</b>：全市场快照不可用，改用当前扫描池内行业均值 Top5（口径较弱）'
+        : '热门板块（' + ((state.hot && state.hot.date) || '最近交易日') + ' ' + rangeTxt + '前' + HOT_SECTOR_N + '）：' + top) +
+      ' —— 推荐仅从热门板块中筛选' +
+      (mode === 'long' ? '（≥75 分长线股豁免）' : '') + '</div>';
+  }
   if (IS_FILE) {
     html += '<div class="notice">本地直开模式：行情经脚本 JSONP 通道直连东财/腾讯，不依赖服务器与隧道；首次拉取若较慢属正常。</div>';
+  }
+  if (mode === 'vol') {
+    html += '<div class="notice warn">📊 <b>放量精选</b>：综合全市场量比≥1.2 的放量股，按「量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度」五维打分排序。' +
+      '此为<b>分析口径</b>，不构成收益预测；实际交易请叠加「策略」页形态白名单与量价确认。</div>';
+    const vv = volValidation();
+    const base = vv.out.find(b => b.k === '全样本');
+    const hot = vv.out.find(b => b.k === '≥2.0');
+    const thin = vv.out.find(b => b.k === '量比<1.2');
+    if (vv.stocks && base && base.n > 200 && hot && hot.n > 50 && thin) {
+      const edge5 = hot.avg5 - base.avg5;
+      const edgeThin = thin.avg5 - base.avg5;
+      html += '<div class="notice" style="font-size:11px;padding:6px 10px">📈 <b>回测验证</b>（' + vv.stocks +
+        ' 只 · 全样本内统计，非样本外）：<br>量比≥2.0 → 5 日胜率 <b>' + hot.wr5 + '%</b>、均收 <b>' + signTxt(hot.avg5) + '</b>；' +
+        '量比<1.2 → ' + thin.wr5 + '%、' + signTxt(thin.avg5) + '；基线 ' + base.wr5 + '%、' + signTxt(base.avg5) + '。' +
+        (edge5 > 0.15
+          ? ' 放量组相对基线有正超额，量能维度方向成立。'
+          : (edge5 > 0 ? ' 放量组仅微弱超额，量能权重宜谨慎。'
+            : ' ⚠ 放量组未跑赢基线，量能维度不作收益承诺。')) +
+        (edgeThin > 0 ? '（缩量组反而更强，说明单靠放量择时不充分。）' : '') +
+        ' 因子 IC/IR、五分层与样本外检验见「策略」页<b>因子有效性检验</b>。</div>';
+    }
   }
   if (mode === 'short' && !state.search && state.ind === '全部') {
     const down = state.marketUp === false;
@@ -4932,14 +5438,12 @@ function renderList() {
     html += '<div class="notice' + (gateOK ? '' : ' warn') + '">' + (
       gateOK
         ? '<b>评分已通过样本外门槛</b>：Q5−Q1 5 日胜率/均收为正，组合 Sharpe ' + pf.sharpe + '、Calmar ' + pf.calmar + '。'
-        : '<b>短线综合分未通过样本外验证，已退出排序与展示。</b>推荐名单 = 形态白名单 + 量比≥1.2 + J&lt;80（11 年实测有效），池内按执行分（流动性/波动/收益成本比）排序，不构成收益预测。' +
+        : '<b>短线综合分未通过样本外验证，已退出排序与展示。</b>推荐名单 = 形态白名单 + 量比≥1.2 + J 阈值（牛市<100 / 熊市<80，11 年实测有效），池内按执行分（流动性/波动/收益成本比）排序，不构成收益预测。' +
           (vv && vv.length >= 2
             ? ' 验证记录 Q5−Q1：5 日均收 ' + ((vv[vv.length - 1].avg5 - vv[0].avg5) >= 0 ? '+' : '') + (vv[vv.length - 1].avg5 - vv[0].avg5).toFixed(2) + 'pp、5 日胜率 ' + (vv[vv.length - 1].wr5 - vv[0].wr5) + 'pp'
             : ' 尚未跑滚动回测') +
           (pf ? '；组合 Sharpe ' + pf.sharpe + ' / Calmar ' + pf.calmar + '（门槛 0.5 / 0.3）' : '')
     ) + '</div>';
-    /* 竞价 × 短线合并：开盘后保留当日竞价回顾条（9:25 定格 / 实时快照） */
-    html += auctionStrip();
   }
   /* 资金面情绪行：两融杠杆（T+1）+ 涨跌停温度（实时快照） */
   if (!state.search) {
@@ -4967,7 +5471,7 @@ function renderList() {
   if (mode === 'short' && !filtered.length && !state.search && state.ind === '全部') {
     const topNow = arr.filter(x => x.short && isNum(x.short.exec)).slice(0, 5)
       .map(x => x.name + ' 执行' + Math.round(x.short.exec)).join(' · ');
-    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J&lt;80 的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
+    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J（牛市&lt;100 / 熊市&lt;80）的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
       (topNow ? '<p style="font-size:11px;color:var(--muted)">池内最高执行分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
       '<div class="disc"><b>风险提示：</b>不构成投资建议。</div>';
     head.innerHTML = html;
@@ -4982,6 +5486,7 @@ function renderList() {
     html += '<div class="sec"><b>全部排名</b><span>第 9 – ' + (rest.length + 8) + ' 名 · 共 ' + arr.length + ' 只</span></div>' +
       '<div class="rows">' + rest.map((x, i) => rowHTML(x, mode, i + 9)).join('') + '</div>';
   }
+  html += dataHealthBar();
   html += '<div class="disc"><b>风险提示：</b>以上结果由技术面多因子模型自动生成，仅用于量化研究与观察，不构成任何投资建议。指标存在滞后与失效风险，请结合基本面、仓位与止损纪律独立决策。</div>';
   head.innerHTML = html;
   drawSparks();
@@ -5343,7 +5848,6 @@ function reviewCollect() {
 
 function renderAuction() {
   const head = $('#list');
-  state.auctionView = true;
   const phase = auctionPhase();
   const a = state.auction;
 
@@ -5374,11 +5878,11 @@ function renderAuction() {
     r.limitProb = r.limit.p;   /* 兼容旧字段/旧缓存 */
   });
   const expLimit = a.rows.slice(0, 15).reduce((s, r) => s + (r.limit ? r.limit.p : 0), 0) / 100;
-  const headBar = '<div class="sec"><b>短线 · 竞价阶段 · ' + a.date + '</b>' +
+  const headBar = '<div class="sec"><b>竞价 · 集合竞价 · ' + a.date + '</b>' +
     '<span>' + (a.ts ? new Date(a.ts).toLocaleTimeString('zh-CN', { hour12: false }) + ' 更新' : '') + '</span></div>' +
     '<div class="notice ' + phaseCls + '">' + a.msg +
     ' <b>今日 Top15 预计触板约 ' + expLimit.toFixed(1) + ' 只</b>（开盘涨幅×量比历史统计近似，触板≠封板，20cm 票已折算；卡片标注样本量与 95% 区间）' +
-    '<div style="margin-top:4px;color:var(--muted)">9:30 开盘后自动切换为短线机会列表；竞价只做情境参考，不做高开硬门槛（实测高开≥1% 的 3 日胜率 49.6%，低于基准 52.1%）。</div></div>';
+    '<div style="margin-top:4px;color:var(--muted)">9:30 开盘后停止自动刷新，本页保留当日快照；竞价只做情境参考，不做高开硬门槛（实测高开≥1% 的 3 日胜率 49.6%，低于基准 52.1%）。</div></div>';
 
   const cards = a.rows.slice(0, 15).map((r, i) => {
     const pctCls = r.pct >= 0 ? 'up' : 'down';
@@ -5427,20 +5931,6 @@ function renderAuction() {
   if (b) b.onclick = () => runAuctionScan();
   const lb = $('#lsBtn');
   if (lb) lb.onclick = () => { computeLimitUpStats(); paintAuction(); };
-  $$('#list .card.auction').forEach(c => c.onclick = () => openDetail(c.dataset.code));
-}
-
-/* ---------------- 竞价 × 短线 合并 ----------------
-   · 交易日 9:15–9:30：短线机会页优先展示当日竞价推荐，9:30 自动切回短线列表
-   · 9:30 后：短线列表顶部保留当日竞价回顾条，个股卡片标注竞价涨幅
-   · 竞价数据只做展示/情境标注，不做硬过滤（回测：高开≥1% 3日 49.6%/5日 51.7%，劣于基准 52.1%/52.3%） */
-function showAuctionFirst() {
-  if (state.tab !== 'short') return false;
-  if (state.search || state.ind !== '全部') return false;
-  const d = new Date();
-  if (d.getDay() === 0 || d.getDay() === 6) return false;
-  const p = auctionPhase();
-  return p === 'calling' || p === 'frozen';
 }
 
 /* 仅返回当日有效的竞价结果 */
@@ -5449,38 +5939,10 @@ function auctionToday() {
   return (a && a.rows && a.rows.length && a.date === dayStr(new Date())) ? a : null;
 }
 
-function auctionHit(code) {
-  const a = auctionToday();
-  if (!a) return null;
-  for (const r of a.rows) if (r.code === code) return r;
-  return null;
-}
-
-/* 开盘后短线列表顶部的竞价回顾条 */
-function auctionStrip() {
-  const a = auctionToday();
-  if (!a) return '';
-  a.rows.forEach(r => {
-    if (!r.limit) r.limit = limitUpEstimate(r.code, r.pct, isNum(r.volRatio) ? r.volRatio : 1, null);
-    r.limitProb = r.limit.p;
-  });
-  const exp = a.rows.slice(0, 15).reduce((s, r) => s + (r.limit ? r.limit.p : 0), 0) / 100;
-  const top = a.rows.slice(0, 6).map(r =>
-    '<b>' + r.name + '</b> <span class="' + (r.pct >= 0 ? 'up' : 'down') + '">' + signTxt(r.pct) + '</span>'
-  ).join('、');
-  const tag = a.phase === 'open' ? '实时快照' : '9:25 定格';
-  return '<div class="notice" style="font-size:11px;padding:6px 10px">' +
-    '🔔 <b>今日竞价（' + tag + '）</b>：' + top +
-    ' · Top15 预计触板约 <b>' + exp.toFixed(1) + ' 只</b>' +
-    '<span style="color:var(--muted)"> · 竞价仅作情境标注，不参与过滤</span></div>';
-}
-
-/* 竞价页统一重绘入口：仅在竞价时段重绘竞价视图；
-   开盘后绝不在这里重绘短线列表（避免刷新时重置滚动位置、重复写入冷却记录） */
+/* 竞价页统一重绘入口：只重绘独立的竞价 Tab，不再影响短线列表 */
 function paintAuction() {
-  if (state.tab !== 'short') return;
-  if (state.search || state.ind !== '全部') return;
-  if (showAuctionFirst()) renderAuction();
+  if (state.tab !== 'auction') return;
+  renderAuction();
 }
 
 /* 测算引擎面板：展示实测触板率矩阵 + 昨日信号组合 */
@@ -5589,6 +6051,66 @@ function renderReview() {
   $$('.rv-row').forEach(el => el.addEventListener('click', () => openDetail(el.dataset.code)));
 }
 
+/* 因子实验室 UI：IC/IR、五分层、样本内 vs 样本外 */
+function buildFactorLabHTML() {
+  const L = state.factorLab;
+  const fmtIc = v => isNum(v) ? (v >= 0 ? '+' : '') + v.toFixed(3) : '—';
+  const icCls = v => !isNum(v) ? '' : (v >= 0 ? 'up' : 'down');
+  const col = v => !isNum(v) ? 'var(--muted)' : (v >= 0 ? 'var(--up)' : 'var(--down)');
+  const verdict = (a, o) => {
+    if (!a || a.n < 2 || !isNum(a.meanIc)) return '<span style="color:var(--muted)">样本不足</span>';
+    if (!o || o.n < 2 || !isNum(o.meanIc)) return '<span style="color:var(--muted)">样本外不足</span>';
+    if (a.meanIc * o.meanIc <= 0) return '<span style="color:var(--gold)">样本外反转</span>';
+    if (Math.abs(a.meanIc) >= 0.03 && isNum(a.ir) && Math.abs(a.ir) >= 0.3) return '<span style="color:var(--up)">有效</span>';
+    if (Math.abs(a.meanIc) >= 0.02) return '<span style="color:var(--txt)">弱有效</span>';
+    return '<span style="color:var(--muted)">无显著优势</span>';
+  };
+
+  let body = '';
+  if (!L) {
+    body = '<p class="dim">尚未运行。检验只读取历史日线做统计，不改变任何评分权重。</p>';
+  } else if (L.insufficient) {
+    body = '<p class="notice warn" style="font-size:11px">' + L.reason + '</p>';
+  } else {
+    const avgN = L.dates ? Math.round(L.obs / L.dates) : 0;
+    const rows = L.factors.map(f => {
+      const a = f.all;
+      return '<tr><td><b>' + f.name + '</b><div class="dim" style="font-size:9px">' + f.dir + '</div></td>' +
+        '<td class="' + icCls(a.meanIc) + '"><b>' + fmtIc(a.meanIc) + '</b></td>' +
+        '<td>' + (isNum(a.ir) ? a.ir.toFixed(2) : '—') + '</td>' +
+        '<td>' + (isNum(a.t) ? a.t.toFixed(1) : '—') + '</td>' +
+        '<td>' + (isNum(a.pos) ? Math.round(a.pos) + '%' : '—') + '</td>' +
+        '<td style="color:' + col(a.spread) + '"><b>' + (isNum(a.spread) ? (a.spread >= 0 ? '+' : '') + a.spread.toFixed(2) + 'pp' : '—') + '</b></td>' +
+        '<td>' + a.mono + '/4</td></tr>';
+    }).join('');
+    const oosRows = L.factors.map(f => {
+      const o = f.oos;
+      return '<tr><td><b>' + f.name + '</b></td>' +
+        '<td class="' + icCls(o.meanIc) + '">' + fmtIc(o.meanIc) + '</td>' +
+        '<td style="color:' + col(o.spread) + '">' + (isNum(o.spread) ? (o.spread >= 0 ? '+' : '') + o.spread.toFixed(2) + 'pp' : '—') + '</td>' +
+        '<td>' + (isNum(o.pos) ? Math.round(o.pos) + '%' : '—') + '</td>' +
+        '<td>' + verdict(f.all, f.oos) + '</td></tr>';
+    }).join('');
+    body = '<p class="dim" style="font-size:11px">样本池 ' + L.stocks + ' 只 · 采样 ' + L.dates + ' 期（每期均 ' + avgN +
+      ' 条截面）· 样本内 ' + L.isDates + ' 期 / 样本外 ' + L.oosDates + ' 期（以 <b>' + L.cutDate + '</b> 切分）· 因子值 → 未来 ' + L.fwdDays + ' 日收盘收益，未扣成本</p>' +
+      '<h4>全样本（Rank IC · 五分层）</h4><div style="overflow-x:auto"><table class="bt">' +
+      '<thead><tr><th>因子</th><th>均值 IC</th><th>IR</th><th>t 值</th><th>IC&gt;0</th><th>Q5−Q1</th><th>单调</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+      '<h4>样本外（后 ' + L.oosDates + ' 期，规则冻结）</h4><div style="overflow-x:auto"><table class="bt">' +
+      '<thead><tr><th>因子</th><th>均值 IC</th><th>Q5−Q1</th><th>IC&gt;0</th><th>判定</th></tr></thead><tbody>' + oosRows + '</tbody></table></div>';
+  }
+
+  const cfg = '<div style="display:flex;gap:10px;margin-top:10px">' +
+    '<button class="btn" id="runFactorBtn" style="flex:1">运行因子检验（IC / 分层 / 样本外）</button>' +
+    (L && !L.insufficient ? '<button class="btn" id="clearFactorBtn" style="flex:0 0 auto">清除</button>' : '') + '</div>';
+
+  return '<section><h3>因子有效性检验 <em>FACTOR IC · OUT-OF-SAMPLE</em></h3>' +
+    '<p>每 5 个交易日取一个横截面，计算各价量因子与<b>未来 5 日收益</b>的 Spearman 秩相关（Rank IC）；再按因子值分五层看 Q1→Q5 的前瞻收益是否单调。样本按时间前 70% / 后 30% 切分，样本外<b>不重新调参、不重挑因子</b>，直接沿用样本内的统计口径，用来判断因子方向是否被拟合。</p>' +
+    body +
+    '<p class="dim" style="font-size:11px">IC 为正 = 因子值越大、未来 5 日收益越高；为负表示反向有效（如反转/低波因子）。IR = 均值 IC ÷ IC 标准差，|IC|≥0.03 且 |IR|≥0.3 才算有效；样本外与样本内同号才说明方向稳定。Q5−Q1 为最高分位减最低分位的 5 日平均收益差（pp），「单调」= 五层收益沿因子方向递增/递减的步数（满分 4）。</p>' +
+    '<p class="notice" style="font-size:11px">⚠ <b>只覆盖价量因子</b>：本地没有 point-in-time 财务数据，估值 / 质量 / 红利 / GARP 等基本面因子无法做历史 IC，长线模型的财务部分因此<b>未经本检验</b>。样本池为当前扫描入选股（非历史全市场成分），存在选择与幸存者偏差；IC 是统计相关性，不等于可实现收益，也不含交易成本。</p>' +
+    cfg + '</section>';
+}
+
 function renderStrategy() {
   $('#list').innerHTML = '<div class="art">' +
     '<section><h3>工具说明 <em>WHAT IT DOES</em></h3>' +
@@ -5626,6 +6148,7 @@ function renderStrategy() {
       '<p>仅展示 <b>≥50 分</b> 的标的，并与「形态胜率」一起呈现。适合：3–5 个交易日持有，严格执行止损与时间止损。</p></section>' +
     buildBacktestHTML() +
     buildLongBacktestHTML() +
+    buildFactorLabHTML() +
     '<section><h3>交易策略 <em>HOW TO TRADE</em></h3>' +
       '<div class="kv"><span>资金分层</span><b>核心 60% / 卫星 25% / 现金 15%</b></div>' +
       '<p><b>① 核心仓（长线，60%）</b>：只买长线评分 <b>≥70</b> 且道氏结构向上的标的，按 ATR 单位（1% 风险）建仓，单票不超过 20%。持有 6–18 个月，只按「周线 MACD 死叉」或「跌破年线」离场，不做日内波动博弈。</p>' +
@@ -5713,6 +6236,27 @@ function renderStrategy() {
     state.longBacktest = null;
     state.longBtTs = 0;
     localStorage.removeItem('qr_long_backtest_v2');
+    renderStrategy();
+  };
+
+  /* 因子有效性检验 */
+  const rfb = $('#runFactorBtn');
+  if (rfb) rfb.onclick = () => {
+    rfb.disabled = true;
+    rfb.textContent = '检验中…';
+    setTimeout(() => {
+      try {
+        state.factorLab = null;
+        factorLab();
+      } catch (e) {
+        state.factorLab = { insufficient: true, reason: '检验失败：' + (e && e.message ? e.message : e) };
+      }
+      setTimeout(renderStrategy, 30);
+    }, 30);
+  };
+  const cfb = $('#clearFactorBtn');
+  if (cfb) cfb.onclick = () => {
+    state.factorLab = null;
     renderStrategy();
   };
 }
@@ -5931,20 +6475,20 @@ function renderDetail() {
           (mode === 'short' && s.setupName ? ' · ' + s.setupName : '') + '</b>' +
         '<p>' + (mode === 'long' ? '估值分位 · 质量 · 红利 · 反转 · 低波 · GARP（行业分位）' : '流动性 · 波动约束 · 收益/成本比（短线排序唯一依据）') + '</p></div></div>' +
       '<div class="parts">' + parts + '</div>' +
-      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">下方分项为研究用综合分（未通过样本外验证，已退出推荐排序）；推荐依据 = 形态白名单 + 量比≥1.2 + J&lt;80，11 年实测有效</p>' : '') +
+      (mode === 'short' ? '<p style="margin:6px 0 0;font-size:10px;line-height:1.5;color:var(--muted)">下方分项为研究用综合分（未通过样本外验证，已退出推荐排序）；推荐依据 = 形态白名单 + 量比≥1.2 + J 阈值（牛市&lt;100 / 熊市&lt;80），11 年实测有效</p>' : '') +
     '</div>' +
     sigBlock +
     setupBlock +
     longBlock +
     chanInfo +
     '<div class="chart-t"><span>价格走势 · 90日</span><span class="lg"><i class="d">MA20</i><i class="e">MA60</i><i class="chan-toggle' + (state.showChan ? ' on' : '') + '" style="color:#B98CF6;cursor:pointer;opacity:' + (state.showChan ? '1' : '.45') + '">缠论' + (state.showChan ? '' : '·关') + '</i></span></div>' +
-    '<canvas class="chart" id="cPrice" style="height:208px"></canvas>' +
+    '<canvas class="chart" id="cPrice" role="img" aria-label="近 90 日 K 线价格走势图，可按上方按钮叠加缠论笔与中枢" style="height:208px"></canvas>' +
     '<div class="chart-t"><span>MACD(12,26,9)</span><span class="lg"><i class="d">DIF</i><i class="e">DEA</i></span></div>' +
-    '<canvas class="chart" id="cMacd" style="height:84px"></canvas>' +
+    '<canvas class="chart" id="cMacd" role="img" aria-label="MACD 指标图，含 DIF 与 DEA 线" style="height:84px"></canvas>' +
     '<div class="chart-t"><span>KDJ(9,3,3)</span><span class="lg"><i class="d">K</i><i class="e">D</i><i style="color:#B98CF6">J</i></span></div>' +
-    '<canvas class="chart" id="cKdj" style="height:84px"></canvas>' +
+    '<canvas class="chart" id="cKdj" role="img" aria-label="KDJ 指标图，含 K、D、J 三条线" style="height:84px"></canvas>' +
     '<div class="chart-t"><span>筹码分布 · CYQ250</span><span class="lg"><i class="d" style="color:#FF5C5C">获利盘</i><i class="e" style="color:#4CC9F0">套牢盘</i><i style="color:#E5B45B">平均成本</i></span></div>' +
-    '<canvas class="chart" id="cCyq" style="height:148px"></canvas>' +
+    '<canvas class="chart" id="cCyq" role="img" aria-label="筹码分布图，展示获利盘、套牢盘与平均成本" style="height:148px"></canvas>' +
     /* —— 筹码形态分析与入场/出场建议 —— */
     (function() {
       const ca = cyqAdvice(x);
@@ -6754,10 +7298,10 @@ function bindEvents() {
     const b = e.target.closest('.tab');
     if (!b) return;
     state.tab = b.dataset.tab;
-    if (state.tab === 'strategy') state.search = '';
+    if (state.tab === 'strategy' || state.tab === 'auction') state.search = '';
     render();
-    /* 竞价 × 短线合并：9:15–9:30 切到短线页，自动拉当日竞价并启动 10 秒刷新 */
-    if (state.tab === 'short') {
+    /* 竞价页独立：9:15–9:30 切入时自动拉当日竞价并启动 10 秒刷新 */
+    if (state.tab === 'auction') {
       const ph = auctionPhase();
       if (ph === 'calling' || ph === 'frozen') {
         if (!auctionToday()) runAuctionScan();
@@ -6772,9 +7316,7 @@ function bindEvents() {
     state.search = e.target.value.trim();
     clearTimeout(timer);
     timer = setTimeout(() => {
-      if (state.tab === 'long' || state.tab === 'short') {
-        if (showAuctionFirst()) renderAuction(); else renderList();
-      }
+      if (state.tab === 'long' || state.tab === 'short' || state.tab === 'vol') renderList();
     }, 180);
   });
 
@@ -6783,13 +7325,13 @@ function bindEvents() {
     if (!b) return;
     state.ind = b.dataset.ind;
     $$('.fchip', $('#industryRow')).forEach(x => x.classList.toggle('active', x.dataset.ind === state.ind));
-    if (showAuctionFirst()) renderAuction(); else renderList();
+    renderList();
   });
 
   $('#list').addEventListener('click', e => {
     const el = e.target.closest('[data-code]');
     if (!el) return;
-    const mode = state.tab === 'short' ? 'short' : 'long';
+    const mode = (state.tab === 'short' || state.tab === 'auction') ? 'short' : 'long';
     openDetail(el.dataset.code, mode);
   });
 
@@ -6846,11 +7388,11 @@ function render() {
   renderTabs();
   renderRegime();
   const isStrategy = state.tab === 'strategy';
-  $('#toolbar').classList.toggle('hide', isStrategy);
+  $('#toolbar').classList.toggle('hide', isStrategy || state.tab === 'auction');
   if (isStrategy) renderStrategy();
   else if (state.tab === 'watch') renderWatch();
   else if (state.tab === 'review') renderReview();
-  else if (showAuctionFirst()) renderAuction();
+  else if (state.tab === 'auction') renderAuction();
   else renderList();
   const n = Object.keys(state.data).length;
   const scope = state.marketTotal && n
@@ -6882,7 +7424,7 @@ function startAutoRefresh() {
   }, 60000);
 }
 
-/* 集合竞价 × 短线：9:15–9:25 每 10s 刷新竞价快照，9:25 定格，9:30 自动切回短线列表 */
+/* 集合竞价页：9:15–9:25 每 10s 刷新竞价快照，9:25 定格，9:30 停止刷新 */
 function stopAuctionTimer() {
   if (state.auctionTimer) { clearInterval(state.auctionTimer); state.auctionTimer = 0; }
 }
@@ -6898,7 +7440,7 @@ function startAuctionTimer() {
     if (p === 'before') return;           /* 8:00–9:15：等待竞价开始 */
     if (p === 'calling') { if (!state.auction.frozen) runAuctionScan(); return; }
     if (p === 'frozen') { if (!state.auction.frozen) runAuctionScan(); return; }
-    /* 9:30 开盘：停止竞价刷新，短线机会页切回短线列表 */
+    /* 9:30 开盘：停止竞价刷新，竞价页保留当日快照 */
     stopAuctionTimer();
     render();
     startAutoRefresh();
@@ -6913,10 +7455,9 @@ async function init() {
   loadNorth();
   loadLimitStats();
   loadLhb();
-  loadCloseCache();
-  /* 竞价 × 短线合并：交易日 9:15–9:30 打开应用，默认进入短线机会页并直接展示当日竞价 */
+  /* 竞价页独立：交易日 9:15–9:30 打开应用，默认进入竞价页 */
   const ph0 = auctionPhase();
-  if (ph0 === 'calling' || ph0 === 'frozen') state.tab = 'short';
+  if (ph0 === 'calling' || ph0 === 'frozen') state.tab = 'auction';
   bindEvents();
   const pack = await readCache();
   if (pack) {
@@ -6938,15 +7479,15 @@ async function init() {
     if (Object.keys(state.data || {}).length) startFinFetch(Object.keys(state.data));
   });
   fetchLhb().then(x => { if (x) { try { scoreAll(); render(); } catch (e) {} } });
-  /* 竞价时段自动拉起当日竞价推荐（与短线列表合并展示） */
-  if (state.tab === 'short' && (ph0 === 'calling' || ph0 === 'frozen') && !auctionToday()) runAuctionScan();
+  /* 竞价时段自动拉起当日竞价推荐（仅在独立竞价页展示） */
+  if (state.tab === 'auction' && (ph0 === 'calling' || ph0 === 'frozen') && !auctionToday()) runAuctionScan();
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) { stopAutoRefresh(); stopAuctionTimer(); }
     else {
       startAutoRefresh();
       startAuctionTimer();
-      /* 页面在后台跨过 9:30：回到前台时立即从竞价页切回短线列表 */
-      if (state.tab === 'short' && state.auctionView && auctionPhase() === 'open') render();
+      /* 页面在后台跨过 9:30：回到前台时刷新竞价页快照状态 */
+      if (state.tab === 'auction') render();
     }
   });
 }
