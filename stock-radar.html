@@ -3707,6 +3707,101 @@ async function batchFetchMinuteBars(codes, klt) {
   return out;
 }
 
+/* ---------------- 尾盘 30 分钟放量 ----------------
+   口径：今日 5 分钟线中 14:30 之后（即 14:35–15:00 的 6 根）每分钟均量，
+   对比 14:30 之前全天的每分钟均量。≥1.5× 视为尾盘放量。
+   仅作日内量能观察，不参与任何评分或推荐。 */
+const TAIL30_RATIO = 1.5;
+
+function analyzeTail30(minBars) {
+  const today = shToday();
+  const bars = (minBars || []).filter(b => b.t && b.t.slice(0, 10) === today);
+  if (bars.length < 12) return null;
+  /* 5 分钟 K 的时间戳为周期结束时间：>14:30 即 14:35–15:00，正好是收盘前 30 分钟 */
+  const idx = bars.findIndex(b => (b.t.slice(11) || '') > '14:30');
+  if (idx < 6) return null;
+  const base = bars.slice(0, idx);
+  const tail = bars.slice(idx);
+  if (tail.length < 2) return null;
+  const bVol = base.reduce((s, b) => s + (b.v || 0), 0);
+  const tVol = tail.reduce((s, b) => s + (b.v || 0), 0);
+  const bAvg = bVol / base.length, tAvg = tVol / tail.length;
+  if (!(bAvg > 0)) return null;
+  const startPx = base[base.length - 1].c;
+  return {
+    ratio: +(tAvg / bAvg).toFixed(2),
+    pct: startPx > 0 ? +((last(tail).c / startPx - 1) * 100).toFixed(2) : 0,
+    vol: tVol,
+    bars: tail.length,
+    minutes: tail.length * 5,
+    date: today
+  };
+}
+
+/* 尾盘扫描候选：放量池优先，再按成交额补足，最多 30 只（受批量接口上限约束） */
+function tail30Candidates() {
+  const seen = {}, out = [];
+  const pool = Object.values(state.data).filter(x =>
+    x && ((isNum(volRatioOf(x)) && volRatioOf(x) >= 1.2) || stairVol(x)))
+    .sort((a, b) => ((b.vol && b.vol.score) || 0) - ((a.vol && a.vol.score) || 0));
+  for (const x of pool) {
+    if (out.length >= 24) break;
+    if (!seen[x.code]) { seen[x.code] = 1; out.push(x.code); }
+  }
+  const byAmt = Object.values(state.data).sort((a, b) => (b.amount || 0) - (a.amount || 0));
+  for (const x of byAmt) {
+    if (out.length >= 30) break;
+    if (!seen[x.code]) { seen[x.code] = 1; out.push(x.code); }
+  }
+  return out;
+}
+
+/* 拉取并写入每只股票的 x.tail30（120 秒节流；14:30 前不执行） */
+async function refreshTail30(force) {
+  const d = new Date();
+  if (d.getDay() === 0 || d.getDay() === 6) return;
+  if (d.getHours() * 60 + d.getMinutes() < 14 * 60 + 28) return;
+  if (!force && state.tail30At && Date.now() - state.tail30At < 120000) return;
+  state.tail30At = Date.now();
+  const codes = tail30Candidates();
+  if (!codes.length) return;
+  const md = await batchFetchMinuteBars(codes, 5);
+  let got = 0;
+  for (const code of Object.keys(md)) {
+    const x = state.data[code];
+    if (!x) continue;
+    const t = analyzeTail30(md[code].bars);
+    if (t) { x.tail30 = t; got++; }
+  }
+  if (got) render();
+}
+
+/* 尾盘放量提示条（放量页顶部；14:30 前不显示） */
+function tail30Panel() {
+  const d = new Date();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  if (mins < 14 * 60 + 30) return '';
+  const today = shToday();
+  const items = Object.values(state.data)
+    .filter(x => x && x.tail30 && x.tail30.date === today && x.tail30.ratio >= TAIL30_RATIO)
+    .sort((a, b) => b.tail30.ratio - a.tail30.ratio);
+  const t = d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0');
+  const tag = mins >= 15 * 60 ? '已收盘 · 定格' : '实时 ' + t;
+  if (!items.length) {
+    return '<div class="notice" style="font-size:11px;padding:6px 10px">⏰ <b>尾盘 30 分钟放量</b>（' + tag +
+      '）：暂无达到 ' + TAIL30_RATIO + '× 的个股（扫描 ' + (state.tail30At ? '已完成' : '进行中') +
+      '）。口径：14:30 后 5 分钟均量 ÷ 当日此前均量。</div>';
+  }
+  const list = items.slice(0, 12).map(x =>
+    '<span style="white-space:nowrap;margin-right:10px">' + x.name +
+    ' <b>' + fmt(x.tail30.ratio, 1) + '×</b> ' +
+    '<span class="' + (x.tail30.pct >= 0 ? 'up' : 'down') + '">' + signTxt(x.tail30.pct) + '</span></span>'
+  ).join('');
+  return '<div class="notice" style="font-size:11px;padding:6px 10px;line-height:1.9">⏰ <b>尾盘 30 分钟放量</b>（' + tag +
+    ' · 阈值 ' + TAIL30_RATIO + '×）：<br>' + list +
+    '<div style="color:var(--muted);margin-top:3px">口径：14:30 后 5 分钟均量 ÷ 当日此前均量；仅观察日内量能，不构成收益预测。</div></div>';
+}
+
 /* ========================================
    日线级替代因子（纯日线能算，不依赖分钟数据）
    ======================================== */
@@ -4552,6 +4647,8 @@ async function refreshFull(opts) {
         if (updated > 0) render();  /* 重新渲染让分钟信号显示 */
       } catch (e) { /* 分钟级数据失败不影响主流程 */ }
     })();
+    /* ★ 尾盘 30 分钟放量扫描（14:30 后生效，120 秒节流） */
+    refreshTail30();
     if (fail > 0) toast('已更新 ' + ok + ' 只 · ' + fail + ' 只获取失败', 2400);
     else toast('行情已更新 · ' + ok + ' 只', 1800);
   } else {
@@ -4607,6 +4704,7 @@ async function quickQuote(silent) {
     saveCache();
     render();
     if (!silent) toast('报价已更新 · ' + ok + ' 只', 1800);
+    refreshTail30();   /* 尾盘时段同步刷新 30 分钟量能（内部节流） */
   }
   showSync(false);
   if (!silent) btn.classList.remove('busy');
@@ -5422,6 +5520,7 @@ function renderList() {
     html += '<div class="notice warn">📊 <b>放量精选</b>：综合全市场量比≥1.2 的放量股，另纳入<b>三日阶梯放量</b>（连续 3 日成交量递增、三日总放大≥1.2×）的温和持续放量股；' +
       '按「量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度」五维打分排序，阶梯放量在量能维度 +4 分并以「阶梯×」标注。' +
       '此为<b>分析口径</b>，不构成收益预测；实际交易请叠加「策略」页形态白名单与量价确认。</div>';
+    html += tail30Panel();
     const vv = volValidation();
     const base = vv.out.find(b => b.k === '全样本');
     const hot = vv.out.find(b => b.k === '≥2.0');
@@ -7366,6 +7465,8 @@ function bindEvents() {
         startAuctionTimer();
       }
     }
+    /* 放量页：尾盘时段切入时刷新 30 分钟量能 */
+    if (state.tab === 'vol') refreshTail30();
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 
