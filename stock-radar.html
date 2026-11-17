@@ -1452,6 +1452,19 @@ function volRatioOf(x) {
   return null;
 }
 
+/* 三日阶梯放量：最近 3 根日 K 成交量严格递增（v[t-2]<v[t-1]<v[t]），
+   且三日总放大 ≥1.2 倍。与单日量比互补——捕捉「温和持续放量」而非单日爆量。
+   返回总放大倍数（≥1.2）或 null。仅用于放量池展示，不参与长线/短线策略评分。 */
+function stairVol(x) {
+  const I = x.ind, v = I && I.v;
+  if (!v || v.length < 3) return null;
+  const a = v[v.length - 3], b = v[v.length - 2], c = v[v.length - 1];
+  if (!(a > 0 && b > 0 && c > 0)) return null;
+  if (!(a < b && b < c)) return null;
+  const ratio = c / a;
+  return ratio >= 1.2 ? ratio : null;
+}
+
 /* 放量精选评分：综合所有「放量」（量比≥1.2）的股票，按多维度打分推选。
    维度：量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度（满分 100）。
    ★ 此分数为「分析口径」，未经过样本外回测验证，不构成收益预测；
@@ -1463,6 +1476,7 @@ function scoreVol(x, ctx) {
   const r5 = I.c.length > 6 ? c / I.c[I.c.length - 6] - 1 : 0;
   const hist = last(I.hist), histPrev = I.hist[I.hist.length - 2];
   const vr = volRatioOf(x) || 1;
+  const stair = stairVol(x);   /* 三日阶梯放量（与单日量比互补） */
   /* 中期量能也统一为「不含当日」的基准，避免当日成交把分母抬高、低估放量 */
   const b5 = I.vol5 && I.vol5.length > 1 ? I.vol5[I.vol5.length - 2] : null;
   const b20 = I.vol20 && I.vol20.length > 1 ? I.vol20[I.vol20.length - 2] : null;
@@ -1482,6 +1496,7 @@ function scoreVol(x, ctx) {
   v += vr >= 3 ? 16 : vr >= 2 ? 13 : vr >= 1.5 ? 9 : vr >= 1.2 ? 5 : 0;
   v += vr20 >= 2 ? 8 : vr20 >= 1.5 ? 6 : vr20 >= 1.2 ? 4 : vr20 >= 1.0 ? 2 : 0;
   if (I.brkVol >= 2.0) v += 6; else if (I.brkVol >= 1.5) v += 4;
+  if (stair) v += 4;   /* 三日阶梯放量：温和持续放量加分 */
   parts.push({ k: '量能强度', v: clamp(v, 0, 30), max: 30 });
 
   /* 2. 价格动能 25 */
@@ -1532,6 +1547,7 @@ function scoreVol(x, ctx) {
   const score = clamp(raw, 0, 100);
 
   if (vr >= 2) reasons.push('放量 ' + fmt(vr, 1) + ' 倍');
+  if (stair) reasons.push('三日阶梯放量 ×' + fmt(stair, 1));
   if (pct >= 3) reasons.push('今日 ' + signTxt(pct));
   if (aboveMa20) reasons.push('站上 20 日线');
   if (gd >= 0 && gd <= 3) reasons.push('KDJ 金叉');
@@ -1539,6 +1555,7 @@ function scoreVol(x, ctx) {
   if (turn != null && turn >= 5) reasons.push('换手 ' + fmt(turn, 1) + '%');
 
   return { score, parts, vr: +vr.toFixed(2), vr5: +vr5.toFixed(2), vr20: +vr20.toFixed(2), pct, turn,
+    stair: stair ? +stair.toFixed(2) : 0,
     reasons: reasons.slice(0, 5), risks: risks.slice(0, 4) };
 }
 
@@ -5145,14 +5162,14 @@ function diversify(arr) {
 function sortedList(mode) {
   let arr = Object.values(state.data).filter(x => x.long && x.short && (mode !== 'vol' || x.vol));
   arr = arr.filter(x => matchQuery(x, state.search) && (state.ind === '全部' || x.sector === state.ind));
-  /* 放量池：只取量比≥1.2 的股票（综合所有放量股） */
-  if (mode === 'vol') arr = arr.filter(x => { const vr = volRatioOf(x); return isNum(vr) && vr >= 1.2; });
+  /* 放量池：量比≥1.2 的股票，或「三日阶梯放量」（连续 3 日量增、总放大≥1.2×）的温和持续放量股 */
+  if (mode === 'vol') arr = arr.filter(x => { const vr = volRatioOf(x); return (isNum(vr) && vr >= 1.2) || !!stairVol(x); });
   /* 热门板块过滤：只在默认推荐视图生效（推荐只出自热门板块）；
      长线 ≥75 分的高质量股豁免（震荡市不挡高分冷门股）；
      用户手动选行业/搜索时尊重其选择，不再叠加 */
   if (!state.search && state.ind === '全部') {
     const hs = hotSet();
-    if (hs) arr = arr.filter(x => hs[x.sector] || (mode === 'long' && x.long.score >= 75));
+    if (hs) arr = arr.filter(x => hs[x.sector] || (mode === 'long' && x.long.score >= 75) || (mode === 'vol' && !!stairVol(x)));
   }
   /* 排序：长线=长线评分，短线=执行分，放量=放量评分 */
   arr.sort((a, b) => mode === 'long' ? b.long.score - a.long.score
@@ -5213,6 +5230,7 @@ function cardHTML(x, mode, rank) {
   const footLong = '长线 ' + fmt(score, 1) + ' · ' + (s.sleeveName ? s.sleeveName + ' sleeve' : '质量/估值/红利') +
     (s.finMissing ? ' · 基本面待补齐' : '');
   const footVol = '放量 ' + fmt(score, 0) + ' · 量比 ' + (isNum(s.vr) ? fmt(s.vr, 2) : '—') +
+    (s.stair ? ' · 阶梯×' + fmt(s.stair, 1) : '') +
     ' · 涨幅 ' + (isNum(s.pct) ? signTxt(s.pct) : '—') +
     (isNum(s.turn) ? ' · 换手 ' + fmt(s.turn, 1) + '%' : '');
   /* 观察标签：只展示，不计分、不过滤、不进推荐（与 reasons 严格分开，避免被当成入选理由） */
@@ -5371,7 +5389,7 @@ function renderList() {
   const title = state.search ? '搜索结果' : state.ind !== '全部' ? state.ind + ' · 行业筛选' : mode === 'long' ? '今日长线精选' : mode === 'vol' ? '今日放量精选' : '今日短线机会';
   const note = ((state.search || state.ind !== '全部') ? '共 ' + arr.length + ' 只'
       : mode === 'short' ? ('主池 ' + mainArr.length + ' 只 · 超跌池 ' + oversoldX.length + ' 只')
-      : mode === 'vol' ? ('放量股 ' + arr.length + ' 只 · 量比≥1.2 · 同行业最多2只')
+      : mode === 'vol' ? ('放量股 ' + arr.length + ' 只 · 量比≥1.2 或 三日阶梯放量 · 同行业最多2只')
       : cards.length + ' 只精选 · 同行业最多2只') +
     (mode === 'short' && arr.length >= 20 ? ' · 分位基于当前 ' + arr.length + ' 只扫描池' : '');
   let html = '<div class="sec"><b>' + title + '</b><span>' + note + '</span></div>' + shapeBar;
@@ -5389,13 +5407,14 @@ function renderList() {
         ? '<b>热门板块已降级</b>：全市场快照不可用，改用当前扫描池内行业均值 Top5（口径较弱）'
         : '热门板块（' + ((state.hot && state.hot.date) || '最近交易日') + ' ' + rangeTxt + '前' + HOT_SECTOR_N + '）：' + top) +
       ' —— 推荐仅从热门板块中筛选' +
-      (mode === 'long' ? '（≥75 分长线股豁免）' : '') + '</div>';
+      (mode === 'long' ? '（≥75 分长线股豁免）' : mode === 'vol' ? '（三日阶梯放量豁免）' : '') + '</div>';
   }
   if (IS_FILE) {
     html += '<div class="notice">本地直开模式：行情经脚本 JSONP 通道直连东财/腾讯，不依赖服务器与隧道；首次拉取若较慢属正常。</div>';
   }
   if (mode === 'vol') {
-    html += '<div class="notice warn">📊 <b>放量精选</b>：综合全市场量比≥1.2 的放量股，按「量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度」五维打分排序。' +
+    html += '<div class="notice warn">📊 <b>放量精选</b>：综合全市场量比≥1.2 的放量股，另纳入<b>三日阶梯放量</b>（连续 3 日成交量递增、三日总放大≥1.2×）的温和持续放量股；' +
+      '按「量能强度 / 价格动能 / 形态健康 / 流动性 / 板块热度」五维打分排序，阶梯放量在量能维度 +4 分并以「阶梯×」标注。' +
       '此为<b>分析口径</b>，不构成收益预测；实际交易请叠加「策略」页形态白名单与量价确认。</div>';
     const vv = volValidation();
     const base = vv.out.find(b => b.k === '全样本');
