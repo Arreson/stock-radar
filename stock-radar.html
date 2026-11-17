@@ -5298,6 +5298,7 @@ function renderList() {
   const today = shToday();
   let filtered;
   let coolMap = null;   /* 短线冷却期：只在最终展示后写入，避免未上榜标的被误冻结 */
+  let shortDiag = null; /* 短线筛选诊断：记录各环节剩余数量，无信号时展示 */
   if (mode === 'long') {
     filtered = div.filter(x => x.long.score >= 70);
     if (!filtered.length) filtered = div;
@@ -5322,23 +5323,28 @@ function renderList() {
       if (!isNum(vr)) return true;          /* 数据缺失不拦（避免整池清空） */
       return vr >= 1.2;
     };
-    filtered = div.filter(x => {
-      const sk = x.short && x.short.setup;
-      if (!sk) return false;
-      if (wl[sk] === false) return false;
-      const prevHit = coolMap[x.code];
-      /* 同一交易日内重复渲染（刷新/量化快照回填）不应把当天已展示的信号冷却掉，
-         否则二次渲染会得到空列表；冷却从次日开始计算 */
-      if (prevHit && prevHit !== today && prevHit >= cutoff) return false;
-      /* 综合分门槛已移除：未通过样本外验证的分数不作为过滤条件（诚实口径） */
-      if (!volOK(x)) return false;
+    /* 分步过滤并记录各环节剩余数量（无信号时用于筛选诊断） */
+    const stepSetup = div.filter(x => { const sk = x.short && x.short.setup; return sk && wl[sk] !== false; });
+    /* 同一交易日内重复渲染（刷新/量化快照回填）不应把当天已展示的信号冷却掉，
+       否则二次渲染会得到空列表；冷却从次日开始计算。
+       state.showCooling 为 true 时临时跳过冷却过滤（诊断面板「查看冷却中」） */
+    const inCool = x => { const p = coolMap[x.code]; return p && p !== today && p >= cutoff; };
+    const stepCool = stepSetup.filter(x => state.showCooling || !inCool(x));
+    const stepVol = stepCool.filter(volOK);
+    /* 综合分门槛已移除：未通过样本外验证的分数不作为过滤条件（诚实口径） */
+    /* J 阈值随市场环境自适应（常量见顶部 SHORT_J_MAX_*）：
+       - 熊市：J≥80 视为超买，次日回落概率高，保持 <80 严格过滤；
+       - 牛市：突破/趋势延续形态天然伴随高 J，放宽到 <100，只剔除高位钝化。 */
+    filtered = stepVol.filter(x => {
       const J = x.ind ? last(x.ind.J) : NaN;
-      /* J 阈值随市场环境自适应（常量见顶部 SHORT_J_MAX_*）：
-         - 熊市：J≥80 视为超买，次日回落概率高，保持 <80 严格过滤；
-         - 牛市：突破/趋势延续形态天然伴随高 J，放宽到 <100，只剔除高位钝化。 */
-      if (isFinite(J) && J >= shortJMax()) return false;
-      return true;
+      return !isFinite(J) || J < shortJMax();
     });
+    shortDiag = {
+      pool: arr.length, div: div.length, setup: stepSetup.length,
+      coolDropped: stepSetup.length - stepCool.length,
+      cool: stepCool.length, vol: stepVol.length, j: filtered.length,
+      cooling: stepSetup.filter(inCool)
+    };
     /* 无信号时不放宽条件（旧逻辑会绕过白名单/冷却，把低质量标的混进推荐） */
   }
 
@@ -5380,7 +5386,7 @@ function renderList() {
   /* 冷却期只记录真正进入推荐卡片的标的。
      此前在过滤阶段就写入，导致被「同行业最多 2 只」或卡片截断剔除、
      用户从未看到的标的也被冻结 20 天。 */
-  if (mode === 'short' && coolMap) {
+  if (mode === 'short' && coolMap && !state.showCooling) {
     cards.forEach(x => { coolMap[x.code] = today; });
     try { localStorage.setItem('qr_short_cooldown', JSON.stringify(coolMap)); } catch (e) {}
   }
@@ -5490,11 +5496,42 @@ function renderList() {
   if (mode === 'short' && !filtered.length && !state.search && state.ind === '全部') {
     const topNow = arr.filter(x => x.short && isNum(x.short.exec)).slice(0, 5)
       .map(x => x.name + ' 执行' + Math.round(x.short.exec)).join(' · ');
-    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p><p>量比≥1.2 且 J（牛市&lt;100 / 熊市&lt;80）的量价确认过滤后为空。宁缺毋滥，等量能配合再出手。</p>' +
-      (topNow ? '<p style="font-size:11px;color:var(--muted)">池内最高执行分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
+    /* 筛选诊断面板：逐步展示各环节剩余数量，定位清空原因 */
+    const d = shortDiag;
+    const stale = state.lastDate && state.lastDate !== today;
+    let diagHtml = '';
+    if (d) {
+      diagHtml = '<div style="text-align:left;font-size:11.5px;line-height:1.9;margin:10px auto;max-width:340px;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:10px;padding:10px 14px">' +
+        '<b>筛选诊断</b>　<span style="color:' + (stale ? 'var(--red)' : 'var(--muted)') + '">数据日期 ' + (state.lastDate || '—') + (stale ? '（非今日，请刷新）' : ' ✓') + '</span><br>' +
+        '热门板块池 ' + d.pool + ' 只 → 同行业去重 ' + d.div + ' 只<br>' +
+        '① 形态白名单：剩 <b>' + d.setup + '</b> 只<br>' +
+        '② 冷却期(20天)：剔除 ' + d.coolDropped + ' 只 → 剩 <b>' + d.cool + '</b> 只<br>' +
+        '③ 量比≥1.2：剩 <b>' + d.vol + '</b> 只<br>' +
+        '④ J 阈值（' + (state.marketUp === false ? '熊市<80' : '牛市<100') + '）：剩 <b>' + d.j + '</b> 只</div>';
+    }
+    let advice = '';
+    if (stale) advice = '数据不是今日，请先点右上角「刷新」拉取最新行情。';
+    else if (d && d.setup === 0) advice = '今日热门板块内没有触发白名单形态的标的，可手动选择行业查看。';
+    else if (d && d.coolDropped > 0 && d.cool === 0) advice = '符合形态与量价的标的都在 20 天冷却期内（为避免重复推荐）。';
+    else if (d && d.vol === 0) advice = '形态合格的标的量比均不足 1.2，等量能配合再出手。';
+    else if (d && d.j === 0) advice = 'J 值均超买，等回落后再看。宁缺毋滥。';
+    else advice = '宁缺毋滥，等量能配合再出手。';
+    const coolBtn = (d && d.cooling && d.cooling.length)
+      ? '<div style="margin-top:6px"><button class="btn" id="showCoolingBtn" style="font-size:12px;padding:6px 14px">查看冷却中的 ' + d.cooling.length + ' 只标的</button></div>' : '';
+    html += '<div class="empty"><div class="ico">🕐</div><p>今日无符合条件信号</p>' +
+      diagHtml +
+      '<p style="font-size:12px">' + advice + '</p>' + coolBtn +
+      (topNow ? '<p style="font-size:11px;color:var(--muted);margin-top:6px">池内最高执行分（未过门槛）：' + topNow + '</p>' : '') + '</div>' +
       '<div class="disc"><b>风险提示：</b>不构成投资建议。</div>';
     head.innerHTML = html;
+    const cb = $('#showCoolingBtn');
+    if (cb) cb.onclick = () => { state.showCooling = true; renderList(); };
     return;
+  }
+  /* 已临时关闭冷却过滤：提示并提供恢复 */
+  if (mode === 'short' && state.showCooling) {
+    html += '<div class="notice warn">已临时关闭冷却期过滤，下列含 20 天内推荐过的标的（冷却中），仅供参考。' +
+      '<button class="btn" id="hideCoolingBtn" style="font-size:11px;padding:2px 10px;margin-left:8px">恢复冷却过滤</button></div>';
   }
   html += '<div class="list">' + cards.map((x, i) => cardHTML(x, mode, i + 1)).join('') + '</div>';
   if (oversoldX.length) {
@@ -5509,6 +5546,8 @@ function renderList() {
   html += '<div class="disc"><b>风险提示：</b>以上结果由技术面多因子模型自动生成，仅用于量化研究与观察，不构成任何投资建议。指标存在滞后与失效风险，请结合基本面、仓位与止损纪律独立决策。</div>';
   head.innerHTML = html;
   drawSparks();
+  const hcb = $('#hideCoolingBtn');
+  if (hcb) hcb.onclick = () => { state.showCooling = false; renderList(); };
   /* 策略页筹码形态筛选 chip 事件（用 cloneNode 去重）*/
   document.querySelectorAll('.chip.list-cyq-filter').forEach(el => {
     el.replaceWith(el.cloneNode(true));
